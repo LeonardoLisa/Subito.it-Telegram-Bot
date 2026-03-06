@@ -5,17 +5,16 @@ Date: 2026-03-06
 Author: Leonardo Lisa
 Description: Documentation for the Subito.it Scraper Daemon and Telegram Bot.
 Requirements: Python 3.8+, requests, beautifulsoup4, python-dotenv
-
-GNU GPLv3 Prelude:
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
+GNU GPLv3 Prelude: |
+  This program is free software: you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+  
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
 ---
 
 # Subito.it Telegram Bot & Scraper Daemon
