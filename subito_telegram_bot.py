@@ -1,7 +1,7 @@
 """
 Filename: subito_telegram_bot.py
-Version: 2.2.0
-Date: 2026-03-05
+Version: 2.4.0
+Date: 2026-03-06
 Author: Leonardo Lisa
 Description: Production-ready Subito.it scraper daemon. 
              Features: HTML entity escaping, connection pooling, Long Polling,
@@ -12,7 +12,7 @@ Requirements: pip install requests beautifulsoup4 python-dotenv
 Usage:
 1. Configure Telegram token in .env: TELEGRAM_BOT_TOKEN=your_token
 2. Define searches in searches.json: {"Category": {"keyword": "URL"}}
-3. Run: python subito_telegram_bot.py --daemon
+3. Run: python subito_telegram_bot.py
 
 GNU GPLv3 Prelude:
 This program is free software: you can redistribute it and/or modify
@@ -36,7 +36,6 @@ import html
 import tempfile
 import socket
 
-# ANSI escape codes for terminal colors
 class Colors:
     HEADER = '\033[95m'
     OKBLUE = '\033[94m'
@@ -50,20 +49,17 @@ class Colors:
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-# File definitions
 SEARCHES_FILE = "searches.json"
 DB_FILE = "tracked_items.json"
 DELETION_QUEUE_FILE = "messages_to_delete.json"
 SUBSCRIBERS_FILE = "subscribers.json"
 KNOWN_URLS_FILE = "known_urls.json"
 
-# Operational Constants
 MAX_SUBSCRIBERS = 15
 TIMEOUT_SECONDS = 3 * 24 * 3600
 WARNING_SECONDS = 2 * 24 * 3600
 TTL_30_DAYS = 30 * 24 * 3600
 
-# Global states
 START_TIME = time.time()
 tracked_items = {}
 messages_to_delete = []
@@ -73,9 +69,9 @@ last_update_id = 0
 cached_searches = {}
 state_lock = threading.Lock()
 shutdown_event = threading.Event()
-sigint_count = 0  # Counter for forced exit
+sigint_count = 0
+DEBUG_MODE = False
 
-# Reusable HTTP Session
 http_session = requests.Session()
 http_session.headers.update({
     "Accept": '"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"',
@@ -97,6 +93,10 @@ def log(msg, color=Colors.ENDC):
     timestamp = datetime.now().strftime('%H:%M:%S')
     print(f"{color}[{timestamp}] {msg}{Colors.ENDC}")
 
+def debug_log(msg, color=Colors.WARNING):
+    if DEBUG_MODE:
+        log(msg, color)
+
 def atomic_save(data, filepath):
     dir_name = os.path.dirname(os.path.abspath(filepath)) or '.'
     fd, tmp_path = tempfile.mkstemp(dir=dir_name, prefix="tmp_", suffix=".json")
@@ -111,9 +111,6 @@ def atomic_save(data, filepath):
 
 def load_local_data():
     global tracked_items, messages_to_delete, subscribers, known_urls, last_update_id
-    
-    if os.path.isfile("searches.tracked") and not os.path.isfile(DB_FILE):
-        os.rename("searches.tracked", DB_FILE)
 
     with state_lock:
         if os.path.isfile(DB_FILE):
@@ -175,15 +172,10 @@ def send_direct_message(chat_id, text):
     if not TELEGRAM_TOKEN: return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
-    try: http_session.post(url, data=payload, timeout=10)
+    try: requests.post(url, data=payload, timeout=10)
     except Exception: pass
 
 def send_telegram_broadcast(text, image_url=None, item_url=None, is_system_msg=False):
-    """
-    Broadcast messages. Downloads image to RAM to bypass WAF, 
-    then uses multipart/form-data for native sendPhoto.
-    System messages bypass the Inline Keyboard generation.
-    """
     if not TELEGRAM_TOKEN: return []
     with state_lock: current_subscribers = list(subscribers.keys())
     if not current_subscribers: return []
@@ -199,14 +191,21 @@ def send_telegram_broadcast(text, image_url=None, item_url=None, is_system_msg=F
         reply_markup["inline_keyboard"].append([{"text": "🗑️ Elimina", "callback_data": "delete_msg"}])
         reply_markup_json = json.dumps(reply_markup)
 
-    # Download image to memory to resolve Telegram 400 Bad Request
     image_bytes = None
     if image_url:
+        debug_log(f"DEBUG - Attempting to download image from: {image_url}", Colors.OKCYAN)
         try:
-            img_res = http_session.get(image_url, timeout=10)
+            img_res = requests.get(image_url, timeout=10)
             if img_res.status_code == 200:
                 image_bytes = img_res.content
-        except Exception: pass
+                debug_log(f"DEBUG - Image downloaded successfully ({len(image_bytes)} bytes).", Colors.OKGREEN)
+            else:
+                debug_log(f"DEBUG - CDN Download Failed: HTTP {img_res.status_code}", Colors.WARNING)
+        except Exception as e: 
+            debug_log(f"DEBUG - Requests Exception on image URL: {e}", Colors.FAIL)
+    else:
+        if not is_system_msg:
+            debug_log("DEBUG - No image_url provided by the scraper for this item.", Colors.WARNING)
 
     for chat_id in current_subscribers:
         try:
@@ -222,10 +221,12 @@ def send_telegram_broadcast(text, image_url=None, item_url=None, is_system_msg=F
                     payload["reply_markup"] = reply_markup_json
                 
                 files = {"photo": ("image.jpg", image_bytes, "image/jpeg")}
-                res = http_session.post(url, data=payload, files=files, timeout=15)
+                res = requests.post(url, data=payload, files=files, timeout=15)
                 data = res.json()
                 
-            # Fallback if binary upload fails or if no image is present
+                if not data.get("ok"):
+                    debug_log(f"DEBUG - Telegram sendPhoto API Error: {data}", Colors.FAIL)
+                
             if not image_bytes or not data.get("ok"):
                 url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
                 payload = {
@@ -236,7 +237,7 @@ def send_telegram_broadcast(text, image_url=None, item_url=None, is_system_msg=F
                 }
                 if reply_markup_json:
                     payload["reply_markup"] = reply_markup_json
-                res = http_session.post(url, data=payload, timeout=10)
+                res = requests.post(url, data=payload, timeout=10)
                 data = res.json()
 
             if data.get("ok"):
@@ -247,8 +248,8 @@ def send_telegram_broadcast(text, image_url=None, item_url=None, is_system_msg=F
                     if chat_id in subscribers:
                         del subscribers[chat_id]
                         state_changed = True
-        except Exception:
-            pass
+        except Exception as e:
+            debug_log(f"DEBUG - Error communicating with Telegram API: {e}", Colors.FAIL)
             
     if state_changed: save_local_data()
     return sent_messages
@@ -260,7 +261,7 @@ def clear_offline_updates():
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
     payload = {"offset": last_update_id + 1, "timeout": 5}
     try:
-        res = http_session.post(url, json=payload, timeout=10)
+        res = requests.post(url, json=payload, timeout=10)
         data = res.json()
         if data.get("ok") and data["result"]:
             with state_lock:
@@ -277,7 +278,7 @@ def process_telegram_updates():
     payload = {"offset": last_update_id + 1, "timeout": 60}
     
     try:
-        res = http_session.post(url, json=payload, timeout=65)
+        res = requests.post(url, json=payload, timeout=65)
         data = res.json()
         
         if data.get("ok") and data["result"]:
@@ -355,11 +356,11 @@ def process_telegram_updates():
                         message_id = msg_obj["message_id"]
                         
                         del_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteMessage"
-                        try: http_session.post(del_url, json={"chat_id": chat_id, "message_id": message_id}, timeout=5)
+                        try: requests.post(del_url, json={"chat_id": chat_id, "message_id": message_id}, timeout=5)
                         except Exception: pass
                         
                         ans_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery"
-                        try: http_session.post(ans_url, json={"callback_query_id": cb_id}, timeout=5)
+                        try: requests.post(ans_url, json={"callback_query_id": cb_id}, timeout=5)
                         except Exception: pass
                             
             if state_changed: save_local_data()
@@ -407,7 +408,7 @@ def manage_message_deletions():
     global messages_to_delete
     if not TELEGRAM_TOKEN: return
     current_time = time.time()
-    retention_period = 36 * 60 * 60 # 36h deletion retention
+    retention_period = 36 * 60 * 60 
     kept_messages = []
     state_changed = False
     
@@ -416,7 +417,7 @@ def manage_message_deletions():
             if current_time - msg["timestamp"] >= retention_period:
                 url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteMessage"
                 payload = {"chat_id": msg["chat_id"], "message_id": msg["message_id"]}
-                try: http_session.post(url, data=payload, timeout=5)
+                try: requests.post(url, data=payload, timeout=5)
                 except Exception: pass 
                 state_changed = True
             else:
@@ -478,6 +479,7 @@ def run_scraper(notify=True, delay=120):
 
             if shutdown_event.is_set(): break
             log(f"Querying: {search_name} -> {keyword}", Colors.OKBLUE)
+            debug_log(f"DEBUG - Target URL: {url}", Colors.OKCYAN)
             
             is_new_query = False
             with state_lock:
@@ -487,7 +489,9 @@ def run_scraper(notify=True, delay=120):
                     state_changed = True
             
             try:
+                debug_log("DEBUG - Sending HTTP GET request...", Colors.OKCYAN)
                 page = http_session.get(url, timeout=10)
+                debug_log(f"DEBUG - HTTP Response Code: {page.status_code}", Colors.OKCYAN)
                 
                 if page.status_code in [403, 429]:
                     sleep_time = delay * backoff_multiplier
@@ -505,11 +509,13 @@ def run_scraper(notify=True, delay=120):
                     log(f"JSON node not found. Possible soft WAF block or invalid URL: {url}", Colors.FAIL)
                     continue
                     
+                debug_log("DEBUG - __NEXT_DATA__ JSON node found. Parsing...", Colors.OKCYAN)
                 json_data = json.loads(script_tag.string)
                 items_list = json_data.get('props', {}).get('pageProps', {}).get('initialState', {}).get('items', {}).get('list', [])
                 
+                debug_log(f"DEBUG - Found {len(items_list)} items in the JSON list.", Colors.OKCYAN)
+                
                 for item_wrapper in items_list:
-                    # Immediate exit control within the internal iteration
                     if shutdown_event.is_set(): break
                     
                     product = item_wrapper.get('item')
@@ -519,9 +525,13 @@ def run_scraper(notify=True, delay=120):
                     with state_lock: is_tracked = link in tracked_items
                         
                     if not link or is_tracked: continue
-                    if product.get('sold', False): continue
+                    if product.get('sold', False): 
+                        debug_log(f"DEBUG - Item marked as sold, skipping: {link}", Colors.WARNING)
+                        continue
 
                     title = product.get('subject', 'No Title')
+                    debug_log(f"DEBUG - Processing new item: {title}", Colors.OKCYAN)
+                    
                     location_geo = product.get('geo', {})
                     location = f"{location_geo.get('town', {}).get('value', 'Unknown')} ({location_geo.get('city', {}).get('shortName', '?')})"
                     
@@ -533,19 +543,35 @@ def run_scraper(notify=True, delay=120):
 
                     description = product.get('body', 'No description provided.')
                     
-                    # Robust image URL extraction resolving protocol-relative and nested issues
+                    # Updated image extraction logic handling the query string cdnBaseUrl endpoint
                     images_list = product.get('images', [])
                     image_url = ''
+                    
                     if images_list:
                         img_obj = images_list[0]
-                        if 'secureuri' in img_obj:
-                            image_url = img_obj['secureuri']
-                        elif 'scale' in img_obj and len(img_obj['scale']) > 0:
-                            image_url = img_obj['scale'][-1].get('secureuri', '')
+                        cdn_base = img_obj.get('cdnBaseUrl')
+                        
+                        if cdn_base:
+                            # Append the required API rule using query string to request the 1x resolution JPEG
+                            image_url = f"{cdn_base}?rule=gallery-desktop-1x-auto"
+                        else:
+                            # Fallback for legacy schemas
+                            image_url = img_obj.get('secureuri') or img_obj.get('uri') or img_obj.get('url') or ''
+                            if not image_url and 'scale' in img_obj and len(img_obj['scale']) > 0:
+                                target_scale = img_obj['scale'][-1]
+                                image_url = target_scale.get('secureuri') or target_scale.get('uri') or target_scale.get('url') or ''
                     
-                    # Resolve Protocol-Relative URLs that cause requests.get() to fail silently
+                    # Resolve Protocol-Relative URLs
                     if image_url and image_url.startswith('//'):
                         image_url = 'https:' + image_url
+                    
+                    # Extensive debug payload tracking image extraction success
+                    if image_url:
+                        debug_log(f"DEBUG - Successfully extracted image URL: {image_url}", Colors.OKGREEN)
+                    elif images_list:
+                        debug_log(f"DEBUG - Image extraction failed. Schema dump: {json.dumps(img_obj)}", Colors.WARNING)
+                    else:
+                        debug_log(f"DEBUG - Ad has no pictures. Full product dump for analysis: {json.dumps(product)}", Colors.WARNING)
                     
                     short_desc = description[:200] + '...' if len(description) > 200 else description
                     
@@ -593,13 +619,7 @@ def run_scraper(notify=True, delay=120):
             
     if state_changed: save_local_data()
 
-def is_active_hour(current_time, start_hour, pause_hour):
-    if start_hour == pause_hour: return True
-    if start_hour < pause_hour: return start_hour <= current_time.hour < pause_hour
-    return start_hour <= current_time.hour or current_time.hour < pause_hour
-
 def signal_handler(signum, frame):
-    """Handle Ctrl+C safely. Second press forces exit."""
     global sigint_count
     sigint_count += 1
     if sigint_count >= 2:
@@ -613,13 +633,22 @@ if __name__ == '__main__':
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--refresh', '-r', action='store_true', help="Refresh once")
-    parser.add_argument('--daemon', '-d', action='store_true', help="Run continuously")
-    parser.add_argument('--activeHour', '-ah', type=int, default=0, help="Start hour (24h notation)")
-    parser.add_argument('--pauseHour', '-ph', type=int, default=0, help="Pause hour (24h notation)")
-    parser.add_argument('--delay', type=int, default=120, help="Polling delay in seconds")
+    # CLI Setup with Help definitions
+    parser = argparse.ArgumentParser(
+        description="Production-ready Subito.it scraper daemon with Telegram native photo broadcasting.",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="""
+Examples:
+  python subito_telegram_bot.py                 # Run with default 120s refresh rate
+  python subito_telegram_bot.py -r 60           # Run with 60s refresh rate
+  python subito_telegram_bot.py -d              # Run with debug logging enabled
+        """
+    )
+    parser.add_argument('--refreshrate', '-r', type=int, default=120, help="Refresh rate in seconds (default: 120)")
+    parser.add_argument('--debug', '-d', action='store_true', help="Enable verbose debug logging for API payloads and image fetching")
     args = parser.parse_args()
+
+    DEBUG_MODE = args.debug
 
     load_local_data()
     clear_offline_updates()
@@ -628,31 +657,24 @@ if __name__ == '__main__':
     tg_thread = threading.Thread(target=telegram_polling_thread, daemon=True)
     tg_thread.start()
 
-    if args.refresh:
-        run_scraper(notify=True, delay=args.delay)
+    log("Starting Subito daemon...", Colors.BOLD)
+    first_run = True
+    
+    while not shutdown_event.is_set():
+        run_scraper(notify=not first_run, delay=args.refreshrate)
         manage_message_deletions()
-
-    if args.daemon:
-        log("Starting Subito daemon...", Colors.BOLD)
-        first_run = True
+        first_run = False
         
-        while not shutdown_event.is_set():
-            now = datetime.now()
+        if not shutdown_event.is_set():
+            log(f"Waiting {args.refreshrate}s before next scan...", Colors.HEADER)
             
-            if is_active_hour(now, args.activeHour, args.pauseHour):
-                run_scraper(notify=not first_run, delay=args.delay)
-                manage_message_deletions()
-                first_run = False
-                if not shutdown_event.is_set():
-                    log(f"Sleeping for {args.delay}s...", Colors.HEADER)
-            else:
-                if not shutdown_event.is_set():
-                    log(f"Outside active hours. Sleeping for {args.delay}s...", Colors.HEADER)
-            
-            # Non-blocking wait handles immediate response to termination signals
-            shutdown_event.wait(args.delay)
+            # Interruptible sleep cycle: blocks for 1 second intervals. 
+            # Breaks immediately upon SIGINT (Ctrl+C).
+            slept_time = 0
+            while slept_time < args.refreshrate and not shutdown_event.is_set():
+                time.sleep(1)
+                slept_time += 1
 
-    # Teardown routines: Safely transmit messages and persist files upon interruption
     try:
         send_telegram_broadcast("🔴 <b>System Offline</b>\nThe bot has been gracefully shut down.", is_system_msg=True)
         save_local_data()
