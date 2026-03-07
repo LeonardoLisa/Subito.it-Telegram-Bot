@@ -1,6 +1,29 @@
-# Subito.it Telegram Bot & Scraper Daemon
+<div align="center">
+  <h1>Subito.it Telegram Bot</h1>
+  <img src="bot.jpg" alt="Subito.it Telegram Bot" width="200">
+  <br><br>
+      <b>If you find this project useful, please consider giving it a Star! It helps the repository grow and keeps you updated.</b> ⭐
+</div>
 
-An advanced scraping daemon for Subito.it with native Telegram integration. Designed for continuous execution, it implements resilient architectures against Web Application Firewalls (WAF), HTTP connection isolation, and autonomously manages memory and subscription states.
+<br>
+
+<a name="english-description"></a>
+## 🇬🇧 Description
+
+A simple and automatic tool that monitors Subito.it for the items you want to buy. Whenever a new ad matches your search, the bot instantly sends you a Telegram message with the price, location, details, and high-quality photos. It runs continuously in the background, making sure you never miss a good deal.
+
+📖 **Are you a beginner?** Read the [Step-by-Step English Guide](https://github.com/LeonardoLisa/Subito.it-Telegram-Bot/wiki#english-version) on the Wiki for easy installation instructions.
+
+---
+
+<a name="descrizione-italiana"></a>
+## 🇮🇹 Descrizione
+
+Monitora automaticamente le tue ricerche su Subito.it e ricevi aggiornamenti via messaggio. Quando viene pubblicato un nuovo annuncio che corrisponde alla tua ricerca, il bot ti invia immediatamente un messaggio su Telegram con prezzo, luogo, dettagli e foto native in alta qualità. Funziona continuamente in background, aiutandoti a non farti scappare l'affare.
+
+📖 Segui la [Guida passo-passo in Italiano](https://github.com/LeonardoLisa/Subito.it-Telegram-Bot/wiki#versione-italiana) sulla Wiki per l'installazione guidata.
+
+---
 
 ## ⚙️ Core Features
 
