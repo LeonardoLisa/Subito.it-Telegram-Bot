@@ -1,23 +1,3 @@
----
-Filename: README.md
-Version: 2.4.0
-Date: 2026-03-06
-Author: Leonardo Lisa
-Description: Documentation for the Subito.it Scraper Daemon and Telegram Bot.
-Requirements: Python 3.8+, requests, beautifulsoup4, python-dotenv
-
-GNU GPLv3 Prelude:
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
----
-
 # Subito.it Telegram Bot & Scraper Daemon
 
 An advanced scraping daemon for Subito.it with native Telegram integration. Designed for continuous execution, it implements resilient architectures against Web Application Firewalls (WAF), HTTP connection isolation, and autonomously manages memory and subscription states.
@@ -101,3 +81,7 @@ The program implements automatic maintenance logic with static parameters define
 * **`TTL_30_DAYS` (30 Days):** Processed listing URLs are saved in `tracked_items.json` to avoid duplicate alerts. To prevent memory leaks, the Garbage Collector (`garbage_collect_tracking()`) uses this threshold (`30 * 24 * 3600`) to automatically purge records older than 30 days from the local database.
 * **`MAX_BACKOFF` (32x):** Found inside `run_scraper()`. If the IP is blocked by Subito.it (HTTP 403/429), the standard `--refreshrate` is progressively multiplied (x2, x4, x8, x16) up to a maximum of 32 times. This Exponential Backoff allows the IP to restore its reputation on the target's firewalls.
 * **`is_new_query` (Zero-notification initialization):** A boolean flag logic inside `run_scraper()`. When a new URL is added to `searches.json`, the very first scan of that link silently populates the database with existing listings, bypassing the broadcast block to avoid flooding users with old alerts.
+
+## License
+This project is licensed under the **GNU Affero General Public License v3 (AGPLv3)**. 
+See the `LICENSE` file for full details.
