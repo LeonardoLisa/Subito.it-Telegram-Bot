@@ -231,10 +231,11 @@ def send_telegram_broadcast(text, image_url=None, item_url=None, is_system_msg=F
     if image_url:
         debug_log(f"DEBUG - Attempting to download image from: {image_url}", Colors.OKCYAN)
         try:
-            # FIX: Added User-Agent spoofing for Subito CDN
+            # Force JPEG response. Telegram sendPhoto endpoint rejects WebP binaries.
+            # User-Agent spoofing bypasses Subito CDN 403 Forbidden blocks.
             dl_headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-                "Accept": "image/webp,image/jpeg,image/*,*/*;q=0.8"
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "image/jpeg"
             }
             img_res = requests.get(image_url, headers=dl_headers, timeout=10)
             
