@@ -7,21 +7,24 @@
 
 <br>
 
+---
+
+## Project Overview
 <a name="english-description"></a>
-## 🇬🇧 Description
+ **🇬🇧**
 
 A simple and automatic tool that monitors Subito.it for the items you want to buy. Whenever a new ad matches your search, the bot instantly sends you a Telegram message with the price, location, details, and high-quality photos. It runs continuously in the background, making sure you never miss a good deal.
 
-📖 **Are you a beginner?** Read the [Step-by-Step English Guide](https://github.com/LeonardoLisa/Subito.it-Telegram-Bot/wiki#english-version) on the Wiki for easy installation instructions.
+📖 **Are you a beginner?** Read the [step-by-step english guide](https://github.com/LeonardoLisa/Subito.it-Telegram-Bot/wiki#english-version) on the Wiki for easy installation instructions.
 
 ---
 
 <a name="descrizione-italiana"></a>
-## 🇮🇹 Descrizione
+ **🇮🇹**
 
 Monitora automaticamente le tue ricerche su Subito.it e ricevi aggiornamenti via messaggio. Quando viene pubblicato un nuovo annuncio che corrisponde alla tua ricerca, il bot ti invia immediatamente un messaggio su Telegram con prezzo, luogo, dettagli e foto native in alta qualità. Funziona continuamente in background, aiutandoti a non farti scappare l'affare.
 
-📖 Segui la [Guida passo-passo in Italiano](https://github.com/LeonardoLisa/Subito.it-Telegram-Bot/wiki#versione-italiana) sulla Wiki per l'installazione guidata.
+📖 Segui la [guida passo-passo in italiano](https://github.com/LeonardoLisa/Subito.it-Telegram-Bot/wiki#versione-italiana) sulla Wiki.
 
 ---
 
