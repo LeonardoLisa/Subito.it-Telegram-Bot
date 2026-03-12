@@ -1,7 +1,7 @@
 """
 Filename: subito_telegram_bot.py
-Version: 2.4.0
-Date: 2026-03-06
+Version: 2.5.0
+Date: 2026-03-12
 Author: Leonardo Lisa
 Description: Production-ready Subito.it scraper daemon. 
              Features: HTML entity escaping, connection pooling, Long Polling,
@@ -35,6 +35,8 @@ import sys
 import html
 import tempfile
 import socket
+import re
+import uuid
 
 class Colors:
     HEADER = '\033[95m'
@@ -67,6 +69,11 @@ subscribers = {}
 known_urls = []
 last_update_id = 0
 cached_searches = {}
+
+# Active conversational states and callback cache
+user_states = {}
+callback_cache = {}
+
 state_lock = threading.Lock()
 shutdown_event = threading.Event()
 sigint_count = 0
@@ -150,16 +157,30 @@ def save_local_data():
 
 def get_searches():
     global cached_searches
-    if not os.path.isfile(SEARCHES_FILE):
-        log(f"Error: {SEARCHES_FILE} not found.", Colors.FAIL)
-        return cached_searches
-    try:
-        with open(SEARCHES_FILE, 'r') as file:
-            cached_searches = json.load(file)
+    with state_lock:
+        if not os.path.isfile(SEARCHES_FILE):
             return cached_searches
-    except json.JSONDecodeError as e:
-        log(f"Malformed JSON in {SEARCHES_FILE}: {e}. Falling back to cached config.", Colors.WARNING)
-        return cached_searches
+        try:
+            with open(SEARCHES_FILE, 'r') as file:
+                cached_searches = json.load(file)
+                return cached_searches
+        except json.JSONDecodeError as e:
+            log(f"Malformed JSON in {SEARCHES_FILE}: {e}. Falling back to cached config.", Colors.WARNING)
+            return cached_searches
+
+def save_searches(data):
+    global cached_searches
+    with state_lock:
+        atomic_save(data, SEARCHES_FILE)
+        cached_searches = data
+
+def create_callback_data(payload):
+    """Stores dict payload in RAM and returns an 11-char ID to bypass Telegram 64-byte limits."""
+    cb_id = str(uuid.uuid4())[:8]
+    with state_lock:
+        callback_cache[cb_id] = payload
+        callback_cache[cb_id]["timestamp"] = time.time()
+    return f"cb_{cb_id}"
 
 def check_internet_connection():
     try:
@@ -271,7 +292,7 @@ def clear_offline_updates():
     except Exception: pass
 
 def process_telegram_updates():
-    global subscribers, last_update_id
+    global subscribers, last_update_id, user_states
     if not TELEGRAM_TOKEN or shutdown_event.is_set(): return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
@@ -319,11 +340,99 @@ def process_telegram_updates():
                         if not searches:
                             send_direct_message(chat_id, "📂 <b>Active Searches:</b>\n\nNo active searches.")
                         else:
-                            msg_text = "📂 <b>Active Searches:</b>\n\n"
-                            for s_name, k_dict in searches.items():
-                                msg_text += f"🔹 <b>{html.escape(s_name)}</b>\n"
-                                for k in k_dict.keys(): msg_text += f"  - <i>{html.escape(k)}</i>\n"
-                            send_direct_message(chat_id, msg_text)
+                            keyboard = {"inline_keyboard": []}
+                            for cat in searches.keys():
+                                cb_data = create_callback_data({"action": "cat", "cat": cat})
+                                keyboard["inline_keyboard"].append([{"text": f"📁 {cat}", "callback_data": cb_data}])
+                            url_send = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+                            requests.post(url_send, json={"chat_id": chat_id, "text": "📂 <b>Seleziona una categoria:</b>", "parse_mode": "HTML", "reply_markup": keyboard}, timeout=10)
+
+                    elif text.startswith("/add"):
+                        parts = text.split(" ", 1)
+                        if len(parts) < 2:
+                            send_direct_message(chat_id, "⚠️ Errore: specifica il link. Uso: /add <link>")
+                            continue
+                        link = parts[1].strip()
+                        
+                        # Async Regex Validation removes Thread Blocking vulnerability
+                        if not re.match(r"^https://www\.subito\.it/.*", link):
+                            send_direct_message(chat_id, "⚠️ Errore: link non valido. Deve iniziare con https://www.subito.it/")
+                            continue
+                        
+                        searches = get_searches()
+                        keyboard = {"inline_keyboard": []}
+                        for cat in searches.keys():
+                            cb_data = create_callback_data({"action": "addcat", "cat": cat})
+                            keyboard["inline_keyboard"].append([{"text": f"📁 {cat}", "callback_data": cb_data}])
+                        
+                        cb_new = create_callback_data({"action": "addcat", "cat": "new"})
+                        keyboard["inline_keyboard"].append([{"text": "➕ Nuova Categoria", "callback_data": cb_new}])
+                        
+                        with state_lock:
+                            user_states[chat_id] = {"state": "waiting_category", "link": link, "timestamp": time.time()}
+                            
+                        url_send = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+                        requests.post(url_send, json={"chat_id": chat_id, "text": "Scegli la macro categoria o creane una nuova:", "reply_markup": keyboard}, timeout=10)
+
+                    elif text.startswith("/rm"):
+                        parts = text.split(" ", 1)
+                        if len(parts) < 2:
+                            send_direct_message(chat_id, "⚠️ Errore. Uso: /rm <keyword>")
+                            continue
+                        kw = parts[1].strip()
+                        searches = get_searches()
+                        
+                        # Find all occurrences to prevent ambiguity
+                        matches = []
+                        for cat, kws in searches.items():
+                            if kw in kws:
+                                matches.append((cat, kw))
+                                
+                        if not matches:
+                            send_direct_message(chat_id, "⚠️ Errore: keyword non trovata.")
+                        else:
+                            keyboard = {"inline_keyboard": []}
+                            for cat, match_kw in matches:
+                                cb_conf = create_callback_data({"action": "rmconf", "cat": cat, "kw": match_kw})
+                                keyboard["inline_keyboard"].append([{"text": f"🗑️ {cat} - {match_kw}", "callback_data": cb_conf}])
+                            keyboard["inline_keyboard"].append([{"text": "❌ Annulla", "callback_data": "rmcanc"}])
+                            
+                            url_send = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+                            msg_text = f"🗑️ <b>Seleziona quale ricerca eliminare:</b>\nKeyword: {html.escape(kw)}"
+                            requests.post(url_send, json={"chat_id": chat_id, "text": msg_text, "parse_mode": "HTML", "reply_markup": keyboard}, timeout=10)
+
+                    elif chat_id in user_states:
+                        with state_lock:
+                            state_data = user_states[chat_id].copy()
+                            user_states[chat_id]["timestamp"] = time.time()
+                            
+                        if state_data["state"] == "waiting_new_cat_name":
+                            new_cat = text.strip()
+                            if len(new_cat) > 30 or not re.match(r'^[a-zA-Z0-9\s\-]+$', new_cat):
+                                send_direct_message(chat_id, "⚠️ Errore: formato non valido (solo lettere, numeri, spazi o trattini, max 30 char). Riprova.")
+                            else:
+                                with state_lock:
+                                    user_states[chat_id]["state"] = "waiting_keyword"
+                                    user_states[chat_id]["category"] = new_cat
+                                send_direct_message(chat_id, f"Categoria '{html.escape(new_cat)}' impostata. Scrivi la keyword per questa ricerca:")
+                                
+                        elif state_data["state"] == "waiting_keyword":
+                            new_kw = text.strip()
+                            cat = state_data["category"]
+                            link = state_data["link"]
+                            searches = get_searches()
+                            if cat not in searches: searches[cat] = {}
+                            
+                            base_kw = new_kw
+                            counter = 1
+                            while new_kw in searches[cat]:
+                                new_kw = f"{base_kw} {counter}"
+                                counter += 1
+                                
+                            searches[cat][new_kw] = link
+                            save_searches(searches)
+                            with state_lock: del user_states[chat_id]
+                            send_direct_message(chat_id, f"✅ Ricerca aggiunta!\n📁 Categoria: {html.escape(cat)}\n🔑 Keyword: {html.escape(new_kw)}")
 
                     elif text == "/help":
                         help_text = (
@@ -331,6 +440,8 @@ def process_telegram_updates():
                             "🔹 /sub - Subscribe to listing alerts\n"
                             "🔹 /unsub - Unsubscribe from alerts\n"
                             "🔹 /search - View active search targets\n"
+                            "🔹 /add <link> - Add a new search\n"
+                            "🔹 /rm <keyword> - Remove a search\n"
                             "🔹 /status - View bot statistics and uptime\n"
                             "🔹 /help - Show this help message"
                         )
@@ -351,17 +462,82 @@ def process_telegram_updates():
                     cb_data = cb_query.get("data")
                     msg_obj = cb_query.get("message")
                     
-                    if cb_data == "delete_msg" and msg_obj:
-                        chat_id = msg_obj["chat"]["id"]
+                    ans_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery"
+                    
+                    if msg_obj:
+                        chat_id = str(msg_obj["chat"]["id"])
                         message_id = msg_obj["message_id"]
+                        edit_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText"
                         
-                        del_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteMessage"
-                        try: requests.post(del_url, json={"chat_id": chat_id, "message_id": message_id}, timeout=5)
-                        except Exception: pass
-                        
-                        ans_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery"
-                        try: requests.post(ans_url, json={"callback_query_id": cb_id}, timeout=5)
-                        except Exception: pass
+                        if cb_data == "delete_msg":
+                            del_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteMessage"
+                            try: requests.post(del_url, json={"chat_id": chat_id, "message_id": message_id}, timeout=5)
+                            except Exception: pass
+                            
+                        elif cb_data == "rmcanc":
+                            try: requests.post(edit_url, json={"chat_id": chat_id, "message_id": message_id, "text": "❌ Operazione annullata."}, timeout=5)
+                            except Exception: pass
+                            
+                        elif cb_data == "search_back":
+                            searches = get_searches()
+                            keyboard = {"inline_keyboard": []}
+                            for cat in searches.keys():
+                                c_data = create_callback_data({"action": "cat", "cat": cat})
+                                keyboard["inline_keyboard"].append([{"text": f"📁 {cat}", "callback_data": c_data}])
+                            try: requests.post(edit_url, json={"chat_id": chat_id, "message_id": message_id, "text": "📂 <b>Seleziona una categoria:</b>", "parse_mode": "HTML", "reply_markup": keyboard}, timeout=5)
+                            except Exception: pass
+                            
+                        elif cb_data.startswith("cb_"):
+                            cache_id = cb_data[3:]
+                            with state_lock: cb_info = callback_cache.get(cache_id)
+                                
+                            if not cb_info:
+                                try: requests.post(ans_url, json={"callback_query_id": cb_id, "text": "Sessione scaduta.", "show_alert": True}, timeout=5)
+                                except Exception: pass
+                                continue
+                                
+                            action = cb_info.get("action")
+                            
+                            if action == "cat":
+                                cat_name = cb_info["cat"]
+                                searches = get_searches()
+                                if cat_name in searches:
+                                    keyboard = {"inline_keyboard": []}
+                                    for kw, url_link in searches[cat_name].items():
+                                        keyboard["inline_keyboard"].append([{"text": kw, "url": url_link}])
+                                    keyboard["inline_keyboard"].append([{"text": "🔙 Indietro", "callback_data": "search_back"}])
+                                    requests.post(edit_url, json={"chat_id": chat_id, "message_id": message_id, "text": f"📂 <b>{html.escape(cat_name)}</b>\nSeleziona una ricerca:", "parse_mode": "HTML", "reply_markup": keyboard}, timeout=5)
+                                    
+                            elif action == "addcat":
+                                cat_name = cb_info["cat"]
+                                with state_lock:
+                                    in_state = chat_id in user_states and user_states[chat_id]["state"] == "waiting_category"
+                                if in_state:
+                                    if cat_name == "new":
+                                        with state_lock:
+                                            user_states[chat_id]["state"] = "waiting_new_cat_name"
+                                            user_states[chat_id]["timestamp"] = time.time()
+                                        requests.post(edit_url, json={"chat_id": chat_id, "message_id": message_id, "text": "Scrivi il nome della nuova categoria (max 30 char, alfanumerico):"}, timeout=5)
+                                    else:
+                                        with state_lock:
+                                            user_states[chat_id]["state"] = "waiting_keyword"
+                                            user_states[chat_id]["category"] = cat_name
+                                            user_states[chat_id]["timestamp"] = time.time()
+                                        requests.post(edit_url, json={"chat_id": chat_id, "message_id": message_id, "text": f"Categoria '{html.escape(cat_name)}' scelta. Scrivi la keyword per questa ricerca:"}, timeout=5)
+                                        
+                            elif action == "rmconf":
+                                cat = cb_info["cat"]
+                                kw = cb_info["kw"]
+                                searches = get_searches()
+                                if cat in searches and kw in searches[cat]:
+                                    del searches[cat][kw]
+                                    if not searches[cat]: del searches[cat]
+                                    save_searches(searches)
+                                    garbage_collect_tracking(searches)
+                                    requests.post(edit_url, json={"chat_id": chat_id, "message_id": message_id, "text": f"✅ Ricerca <b>{html.escape(kw)}</b> eliminata e database pulito.", "parse_mode": "HTML"}, timeout=5)
+
+                    try: requests.post(ans_url, json={"callback_query_id": cb_id}, timeout=5)
+                    except Exception: pass
                             
             if state_changed: save_local_data()
     except requests.exceptions.Timeout:
@@ -372,7 +548,7 @@ def process_telegram_updates():
             shutdown_event.wait(2)
 
 def manage_subscriptions():
-    global subscribers
+    global subscribers, user_states, callback_cache
     if not TELEGRAM_TOKEN or shutdown_event.is_set(): return
     current_time = time.time()
     to_delete = []
@@ -395,6 +571,14 @@ def manage_subscriptions():
         for chat_id in to_delete:
             del subscribers[chat_id]
             state_changed = True
+            
+        # State Garbage Collection (10 minutes TTL)
+        expired_users = [uid for uid, state in user_states.items() if current_time - state.get("timestamp", 0) > 600]
+        for uid in expired_users: del user_states[uid]
+        
+        # Callback Cache Garbage Collection (24 hours TTL)
+        expired_cbs = [cbid for cbid, cbdata in callback_cache.items() if current_time - cbdata.get("timestamp", 0) > 86400]
+        for cbid in expired_cbs: del callback_cache[cbid]
 
     if state_changed: save_local_data()
 
@@ -633,7 +817,6 @@ if __name__ == '__main__':
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # CLI Setup with Help definitions
     parser = argparse.ArgumentParser(
         description="Production-ready Subito.it scraper daemon with Telegram native photo broadcasting.",
         formatter_class=argparse.RawTextHelpFormatter,
@@ -642,10 +825,12 @@ Examples:
   python subito_telegram_bot.py                 # Run with default 120s refresh rate
   python subito_telegram_bot.py -r 60           # Run with 60s refresh rate
   python subito_telegram_bot.py -d              # Run with debug logging enabled
+  python subito_telegram_bot.py --skip          # Skip sending notifications on startup
         """
     )
     parser.add_argument('--refreshrate', '-r', type=int, default=120, help="Refresh rate in seconds (default: 120)")
     parser.add_argument('--debug', '-d', action='store_true', help="Enable verbose debug logging for API payloads and image fetching")
+    parser.add_argument('--skip', '-s', action='store_true', help="Salta l'invio delle notifiche per gli annunci preesistenti all'avvio")
     args = parser.parse_args()
 
     DEBUG_MODE = args.debug
@@ -658,12 +843,17 @@ Examples:
     tg_thread.start()
 
     log("Starting Subito daemon...", Colors.BOLD)
-    first_run = True
+    
+    # Track the initial state of the --skip flag.
+    # It applies only to the first loop cycle, then resets to False.
+    skip_next_notification = args.skip
     
     while not shutdown_event.is_set():
-        run_scraper(notify=not first_run, delay=args.refreshrate)
+        run_scraper(notify=not skip_next_notification, delay=args.refreshrate)
         manage_message_deletions()
-        first_run = False
+        
+        # Reset immediately to resume normal execution.
+        skip_next_notification = False
         
         if not shutdown_event.is_set():
             log(f"Waiting {args.refreshrate}s before next scan...", Colors.HEADER)
