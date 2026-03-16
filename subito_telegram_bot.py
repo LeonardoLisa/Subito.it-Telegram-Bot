@@ -38,6 +38,8 @@ import socket
 import re
 import uuid
 from urllib.parse import urlparse
+from io import BytesIO
+from PIL import Image
 
 class Colors:
     HEADER = '\033[95m'
@@ -240,8 +242,19 @@ def send_telegram_broadcast(text, image_url=None, item_url=None, is_system_msg=F
             img_res = requests.get(image_url, headers=dl_headers, timeout=10)
             
             if img_res.status_code == 200:
-                image_bytes = img_res.content
-                debug_log(f"DEBUG - Image downloaded successfully ({len(image_bytes)} bytes).", Colors.OKGREEN)
+                try:
+                    img = Image.open(BytesIO(img_res.content))
+                    if img.mode != 'RGB':
+                        img = img.convert('RGB')
+                    
+                    out_io = BytesIO()
+                    img.save(out_io, format='JPEG', quality=90)
+                    image_bytes = out_io.getvalue()
+                    
+                    debug_log(f"DEBUG - Image downloaded and strictly converted to JPEG ({len(image_bytes)} bytes).", Colors.OKGREEN)
+                except Exception as e:
+                    debug_log(f"DEBUG - Image conversion failed: {e}", Colors.FAIL)
+                    image_bytes = None
             else:
                 debug_log(f"DEBUG - CDN Download Failed: HTTP {img_res.status_code}", Colors.WARNING)
         except Exception as e: 
@@ -778,8 +791,8 @@ def run_scraper(notify=True, delay=120):
                         cdn_base = img_obj.get('cdnBaseUrl')
                         
                         if cdn_base:
-                            # Append the required API rule using query string to request the 1x resolution JPEG
-                            image_url = f"{cdn_base}?rule=gallery-desktop-1x-auto"
+                            # Append the required API rule without the -auto suffix to prevent WebP delivery
+                            image_url = f"{cdn_base}?rule=gallery-desktop-1x"
                         else:
                             # Fallback for legacy schemas
                             image_url = img_obj.get('secureuri') or img_obj.get('uri') or img_obj.get('url') or ''
