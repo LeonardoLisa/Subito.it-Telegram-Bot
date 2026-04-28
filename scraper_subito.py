@@ -1,6 +1,6 @@
 """
 Filename: scraper_subito.py
-Version: 3.0.0
+Version: 3.1.0
 Date: 2026-04-28
 Author: Leonardo Lisa
 Description: Target-specific Web Scraper for Subito.it. Implements WAF evasion (Safari 15.3), Next.js JSON parsing, and image extraction.
@@ -30,6 +30,7 @@ from io import BytesIO
 class SubitoScraper:
     def __init__(self):
         self.base_url = "https://www.subito.it/"
+        self.debug_mode = False
         # Safari 15.3 footprint effectively bypasses DataDome HTTP 403 blocks
         self.session = cffi_requests.Session(impersonate="safari15_3")
         self.session.headers.update({
@@ -40,17 +41,24 @@ class SubitoScraper:
             "Sec-Fetch-Site": "none",
             "Referer": "https://www.google.com/"
         })
+
+    def _debug_print(self, error_msg):
+        if self.debug_mode:
+            print(f"\033[93m[SCRAPER ERROR] {error_msg}\033[0m")
         
     def fetch_ads(self, url):
         """Fetches the target URL and extracts standardized ad dictionaries."""
         try:
             res = self.session.get(url, timeout=15)
             if res.status_code != 200:
+                self._debug_print(f"HTTP {res.status_code} for URL: {url}")
                 return []
                 
             soup = BeautifulSoup(res.text, 'html.parser')
             script_tag = soup.find('script', id='__NEXT_DATA__')
-            if not script_tag: return []
+            if not script_tag: 
+                self._debug_print("__NEXT_DATA__ JSON payload not found in HTML.")
+                return []
                 
             json_data = json.loads(script_tag.string)
             
@@ -84,7 +92,8 @@ class SubitoScraper:
                     "image_url": self._extract_image_url(ad_data)
                 })
             return parsed_ads
-        except Exception:
+        except Exception as e:
+            self._debug_print(f"fetch_ads exception: {e}")
             return []
 
     def _extract_image_url(self, ad_data):
@@ -114,7 +123,9 @@ class SubitoScraper:
         
         try:
             res = self.session.get(image_url, headers=dl_headers, timeout=15)
-            if res.status_code != 200: return None
+            if res.status_code != 200: 
+                self._debug_print(f"Image CDN HTTP {res.status_code}: {image_url}")
+                return None
                 
             img = Image.open(BytesIO(res.content))
             if img.mode != 'RGB':
@@ -123,5 +134,6 @@ class SubitoScraper:
             out_io = BytesIO()
             img.save(out_io, format='JPEG', quality=90)
             return out_io.getvalue()
-        except Exception:
+        except Exception as e:
+            self._debug_print(f"download_image exception: {e}")
             return None

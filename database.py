@@ -1,7 +1,7 @@
 """
 Filename: database.py
-Version: 3.0.0
-Date: 2026-04-28
+Version: 3.1.0
+Date: 2026-04-29
 Author: Leonardo Lisa
 Description: Atomic file I/O and state management. Implements a fixed-size retention policy (max 30 items per query).
 Requirements: built-in
@@ -40,8 +40,13 @@ class Database:
         self.searches = {}
         self.known_urls = []
         self.last_update_id = 0
+        self.debug_mode = False
         
         self.load_all()
+
+    def _debug_print(self, error_msg):
+        if self.debug_mode:
+            print(f"\033[93m[DB ERROR] {error_msg}\033[0m")
 
     def _atomic_save(self, data, filepath):
         dir_name = os.path.dirname(os.path.abspath(filepath)) or '.'
@@ -50,7 +55,8 @@ class Database:
             with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2)
             os.replace(tmp_path, filepath)
-        except Exception:
+        except Exception as e:
+            self._debug_print(f"Atomic save failed for {filepath}: {e}")
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
 
@@ -59,7 +65,7 @@ class Database:
             if os.path.isfile(self.db_file):
                 try:
                     with open(self.db_file, 'r') as f: self.tracked_items = json.load(f)
-                except: pass
+                except Exception as e: self._debug_print(f"Load {self.db_file}: {e}")
             
             if os.path.isfile(self.sub_file):
                 try:
@@ -67,17 +73,17 @@ class Database:
                         data = json.load(f)
                         self.subscribers = data.get("subscribers", {})
                         self.last_update_id = data.get("last_update_id", 0)
-                except: pass
+                except Exception as e: self._debug_print(f"Load {self.sub_file}: {e}")
                 
             if os.path.isfile(self.search_file):
                 try:
                     with open(self.search_file, 'r') as f: self.searches = json.load(f)
-                except: pass
+                except Exception as e: self._debug_print(f"Load {self.search_file}: {e}")
                 
             if os.path.isfile(self.url_file):
                 try:
                     with open(self.url_file, 'r') as f: self.known_urls = json.load(f)
-                except: pass
+                except Exception as e: self._debug_print(f"Load {self.url_file}: {e}")
 
     def save_all(self):
         with self.lock:

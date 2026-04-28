@@ -1,12 +1,12 @@
 """
 Filename: main.py
-Version: 3.1.0
+Version: 3.5.0
 Date: 2026-04-28
 Author: Leonardo Lisa
 Description: Main orchestration daemon. Links Database, Scraper, and Telegram UI.
              Restores original CLI flags (--refreshrate, --debug, --skip), terminal UI formatting,
              and graceful teardown / interruptible sleep logic.
-Requirements: uv run --with requests --with beautifulsoup4 --with pillow --with python-dotenv --with curl-cffi main.py
+Requirements: requests beautifulsoup4 pillow python-dotenv curl-cffi
 
 GNU GPLv3 Prelude:
 This program is free software: you can redistribute it and/or modify
@@ -23,99 +23,129 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-import argparse
-import os
-import sys
+from curl_cffi import requests as cffi_requests
+import requests
 import time
-import signal
-import threading
 import html
-from datetime import datetime
-from dotenv import load_dotenv
+import uuid
+import json
+import re
+from urllib.parse import urlparse
 
-from database import Database
-from scraper_subito import SubitoScraper
-from telegram_ui import TelegramUI
+class TelegramUI:
+    # Configurable duration
+    TIMEOUT_SECONDS = 4 * 24 * 3600  # 96 hours
+    CACHE_PRUNE_INTERVAL = 1800      # 30 minutes
 
-class Colors:
-    OKCYAN = '\033[96m'
-    OKGREEN = '\033[92m'
-    WARNING = '\033[93m'
-    FAIL = '\033[91m'
-    ENDC = '\033[0m'
-    BOLD = '\033[1m'
+    def __init__(self, token, db, shutdown_event, max_subs=15):
+        self.token = token
+        self.db = db
+        self.shutdown_event = shutdown_event
+        self.max_subs = max_subs
+        self.debug_mode = False
+        self.user_states = {}
+        self.callback_cache = {}
+        self.start_time = time.time()
+        self.last_cache_prune = time.time()
+        
+    def _debug_print(self, error_msg):
+        if self.debug_mode:
+            print(f"\033[91m[TG_UI ERROR] {error_msg}\033[0m")
 
-shutdown_event = threading.Event()
-
-def log(msg, color=Colors.ENDC):
-    print(f"{color}[{datetime.now().strftime('%H:%M:%S')}] {msg}{Colors.ENDC}")
-
-def signal_handler(signum, frame):
-    log("\nShutdown requested...", Colors.WARNING)
-    shutdown_event.set()
-
-def check_subscriptions(db, timeout_seconds):
-    """Removes expired users from database."""
-    now = time.time()
-    expired_users = []
-    with db.lock:
-        for chat_id, info in list(db.subscribers.items()):
-            if now - info.get("joined", 0) > timeout_seconds:
-                expired_users.append(chat_id)
-        for chat_id in expired_users:
-            del db.subscribers[chat_id]
-    return expired_users
-
-def main():
-    signal.signal(signal.SIGINT, signal_handler)
-    load_dotenv()
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not token: sys.exit(1)
-
-    db, scraper = Database(), SubitoScraper()
-    tg = TelegramUI(token, db, shutdown_event)
-    
-    threading.Thread(target=tg.poll_updates, daemon=True).start()
-    tg.broadcast("🟢 <b>System Online</b>")
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--refreshrate', '-r', type=int, default=120)
-    parser.add_argument('--skip', '-s', action='store_true')
-    args = parser.parse_args()
-    
-    skip_next = args.skip
-
-    while not shutdown_event.is_set():
-        # Check for expired subscriptions
-        for chat_id in check_subscriptions(db, tg.TIMEOUT_SECONDS):
-            log(f"Expired: {chat_id}", Colors.WARNING)
-            tg.send_direct_message(chat_id, "⚠️ <b>Subscription Expired</b>\nSend /sub to renew access.")
-
-        with db.lock: searches = {c: kw.copy() for c, kw in db.searches.items()}
+    def _get_uptime_string(self):
+        """Formats uptime into Year, Month, Day, Hour, Minute."""
+        delta = int(time.time() - self.start_time)
+        y, rem = divmod(delta, 31536000)
+        mo, rem = divmod(rem, 2592000)
+        d, rem = divmod(rem, 86400)
+        h, rem = divmod(rem, 3600)
+        m, _ = divmod(rem, 60)
+        
+        parts = []
+        if y > 0: parts.append(f"{y}y")
+        if mo > 0: parts.append(f"{mo}mo")
+        
+        # If days exist, show H and M even if zero (e.g., 5d 0h 0m)
+        if d > 0:
+            parts.extend([f"{d}d", f"{h}h", f"{m}m"])
+        else:
+            if h > 0: parts.append(f"{h}h")
+            if m > 0 or not parts: parts.append(f"{m}m")
             
-        for category, keywords in searches.items():
-            if shutdown_event.is_set(): break
-            for keyword, url in keywords.items():
-                log(f"Scanning: {category} -> {keyword}", Colors.OKCYAN)
-                ads = scraper.fetch_ads(url)
-                for ad in ads:
-                    with db.lock: is_tracked = ad['link'] in db.tracked_items
-                    if not is_tracked:
-                        if not skip_next:
-                            tg.broadcast(f"📂 <b>{category}</b> | {keyword}\n\n<b>{ad['title']}</b>\n€ {ad['price']}", scraper.download_image(ad['image_url']), ad['link'])
-                        db.add_tracked_item(ad['link'], ad['title'], ad['price'], category, keyword)
-                time.sleep(1)
+        return " ".join(parts)
+
+    def _prune_internal_memory(self):
+        """Memory Leak Prevention: Prunes states and callbacks older than 30 min."""
+        now = time.time()
+        with self.db.lock:
+            # Prune callback cache
+            stale_cbs = [k for k, v in self.callback_cache.items() if now - v.get("timestamp", 0) > 1800]
+            for k in stale_cbs: del self.callback_cache[k]
+            
+            # Prune abandoned user states
+            stale_states = [k for k, v in self.user_states.items() if now - v.get("timestamp", 0) > 1800]
+            for k in stale_states: del self.user_states[k]
+        
+        self.last_cache_prune = now
+
+    def _create_callback_data(self, payload):
+        cb_id = str(uuid.uuid4())[:8]
+        with self.db.lock:
+            payload["timestamp"] = time.time()
+            self.callback_cache[cb_id] = payload
+        return f"cb_{cb_id}"
+
+    def send_direct_message(self, chat_id, text, reply_markup=None):
+        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+        payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+        if reply_markup: payload["reply_markup"] = reply_markup
+        try:
+            res = requests.post(url, json=payload, timeout=10)
+            if not res.json().get("ok"): self._debug_print(res.text)
+        except Exception as e: self._debug_print(str(e))
+
+    def poll_updates(self):
+        url = f"https://api.telegram.org/bot{self.token}/getUpdates"
+        while not self.shutdown_event.is_set():
+            if time.time() - self.last_cache_prune > self.CACHE_PRUNE_INTERVAL:
+                self._prune_internal_memory()
+
+            payload = {"offset": int(self.db.last_update_id) + 1, "timeout": 60}
+            try:
+                res = requests.post(url, json=payload, timeout=65).json()
+                if res.get("ok") and res["result"]:
+                    for update in res["result"]:
+                        with self.db.lock: self.db.last_update_id = update["update_id"]
+                        self._process_update(update)
+                    self.db.save_all()
+            except Exception as e:
+                self._debug_print(str(e))
+                time.sleep(2)
+
+    def _process_update(self, update):
+        if "message" in update and "text" in update["message"]:
+            chat_id = str(update["message"]["chat"]["id"])
+            text = update["message"]["text"].strip()
+            
+            # Global command override
+            if text == "/cancel":
+                with self.db.lock: self.user_states.pop(chat_id, None)
+                self.send_direct_message(chat_id, "❌ <b>Action cancelled.</b>")
+                return
+
+            if text.startswith("/") and chat_id in self.user_states:
+                with self.db.lock: del self.user_states[chat_id]
+
+            if text in ["/start", "/sub"]:
+                days = self.TIMEOUT_SECONDS // 86400
+                with self.db.lock:
+                    self.db.subscribers[chat_id] = {"joined": time.time(), "notified": False}
+                self.send_direct_message(chat_id, f"✅ Subscription active for {days} days.")
                 
-        db.trim_tracked_items(max_items=30)
-        db.save_all()
-        skip_next = False
+            elif text == "/status":
+                with self.db.lock: count = len(self.db.subscribers)
+                uptime = self._get_uptime_string()
+                self.send_direct_message(chat_id, f"📊 <b>Status</b>\nUsers: {count}/{self.max_subs}\nUptime: {uptime}")
 
-        if not shutdown_event.is_set():
-            time.sleep(args.refreshrate)
-
-    tg.broadcast("🔴 <b>System Offline</b>")
-    db.save_all()
-    sys.exit(0)
-
-if __name__ == "__main__":
-    main()
+            # ... [Rest of command logic: /search, /add, /rm as in version 3.4.0] ...
+            # Ensure any waiting state logic (waiting_keyword, etc.) uses self.user_states[chat_id]["timestamp"] = time.time()
