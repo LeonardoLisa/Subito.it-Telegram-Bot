@@ -24,6 +24,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 import json
 from curl_cffi import requests as cffi_requests
 from bs4 import BeautifulSoup
+import time
 from PIL import Image
 from io import BytesIO
 
@@ -47,22 +48,52 @@ class SubitoScraper:
             print(f"\033[93m[SCRAPER ERROR] {error_msg}\033[0m")
         
     def fetch_ads(self, url):
-        """Fetches the target URL and extracts standardized ad dictionaries."""
-        try:
-            res = self.session.get(url, timeout=15)
-            if res.status_code != 200:
+        """
+        Fetches the target URL with exponential backoff retries on 403/429 errors.
+        """
+        retries = 3
+        wait_time = 5  # Initial wait in seconds
+        
+        for attempt in range(retries):
+            try:
+                res = self.session.get(url, timeout=15)
+                
+                # Success: Parse and return results
+                if res.status_code == 200:
+                    return self._parse_response(res.text)
+                
+                # Blocked: Retry with exponential backoff
+                if res.status_code in [403, 429]:
+                    self._debug_print(f"Attempt {attempt + 1} failed (HTTP {res.status_code}). Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                    wait_time *= 2
+                    continue
+                
                 self._debug_print(f"HTTP {res.status_code} for URL: {url}")
                 return []
                 
-            soup = BeautifulSoup(res.text, 'html.parser')
-            script_tag = soup.find('script', id='__NEXT_DATA__')
-            if not script_tag: 
-                self._debug_print("__NEXT_DATA__ JSON payload not found in HTML.")
+            except Exception as e:
+                self._debug_print(f"fetch_ads exception: {e}")
+                if attempt < retries - 1:
+                    time.sleep(wait_time)
+                    wait_time *= 2
+                    continue
                 return []
-                
-            json_data = json.loads(script_tag.string)
+        return []
+
+    def _parse_response(self, html_content):
+        """
+        Internal helper to parse the __NEXT_DATA__ JSON payload from Subito.it.
+        """
+        soup = BeautifulSoup(html_content, 'html.parser')
+        script_tag = soup.find('script', id='__NEXT_DATA__')
+        if not script_tag:
+            self._debug_print("__NEXT_DATA__ JSON payload not found in HTML.")
+            return []
             
-            # Subito.it JSON schema points to 'originalList'
+        try:
+            json_data = json.loads(script_tag.string)
+            # Navigate the JSON schema to find the items list
             items_node = json_data.get('props', {}).get('pageProps', {}).get('initialState', {}).get('items', {})
             items_list = items_node.get('originalList', [])
             
@@ -70,6 +101,8 @@ class SubitoScraper:
             for product in items_list:
                 ad_data = product.get('item', product)
                 link = ad_data.get('urls', {}).get('default', '')
+                
+                # Filter out sold items or missing links
                 if not link or ad_data.get('sold', False):
                     continue
                     
@@ -93,7 +126,7 @@ class SubitoScraper:
                 })
             return parsed_ads
         except Exception as e:
-            self._debug_print(f"fetch_ads exception: {e}")
+            self._debug_print(f"_parse_response error: {e}")
             return []
 
     def _extract_image_url(self, ad_data):

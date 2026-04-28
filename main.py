@@ -23,6 +23,7 @@ import signal
 import threading
 import html
 import socket
+import random
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -165,7 +166,12 @@ def main():
                             tg.broadcast(msg, img, ad['link'])
 
                         db.add_tracked_item(ad['link'], ad['title'], ad['price'], category, keyword)
-                time.sleep(1)
+                
+                # Implement random jitter between 2 and 6 seconds to mimic human behavior
+                jitter = random.uniform(1.0, 3.5)
+                debug_log(f"Applying jitter: {jitter:.2f}s")
+                #time.sleep(1)
+                time.sleep(jitter)
 
         db.trim_tracked_items(max_items=30)
         db.save_all()
