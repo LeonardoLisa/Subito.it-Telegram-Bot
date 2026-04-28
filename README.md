@@ -93,7 +93,7 @@ User interaction occurs via direct chat with the bot.
 * `/unsub`: Unsubscribes the user and removes the Chat ID from the database.
 * `/search`: Prints the hierarchical list of active searches currently in the database.
 * `/add <link>`: Starts an interactive flow to add a new search. You will be guided to select/create a category and set a keyword. **Note:** The link must be a valid Subito.it URL strictly pointing to the `/annunci-italia/vendita/` path.
-* `/rm <keyword>`: Removes an existing search via an interactive confirmation menu.
+* `/rm <keyword>`: Removes an existing search via an interactive confirmation menu. Empty categories are automatically cleaned up.
 * `/status`: Displays the number of active users and the system uptime formatted in years, months, days, hours, and minutes.
 * `🛑 /cancel`: Instantly aborts the current action (e.g., waiting for keyword input) and resets the user's state.
 * `/help`: Displays the command guide.
@@ -103,10 +103,9 @@ User interaction occurs via direct chat with the bot.
 The program implements automatic maintenance logic with static parameters defined in the source code.
 
 * **`MAX_SUBSCRIBERS` (15):** To prevent Telegram API rate-limiting during broadcasts, the system accepts a maximum of 15 simultaneous users.
-* **`TIMEOUT_SECONDS` (96 Hours):** Subscriptions have a Time-To-Live of 4 days (`4 * 24 * 3600`). Once this threshold is reached, the user is automatically unsubscribed if they do not renew by sending `/sub` again.
-* **WAF Exponential Backoff:** In caso di blocco IP (HTTP 403), il sistema effettua fino a 3 tentativi di retry, raddoppiando il tempo di attesa a ogni fallimento (es. 5s, 10s, 20s) prima di saltare l'annuncio. Include anche un jitter randomico (2.5 - 5.5s) tra una query e l'altra per eludere il riconoscimento dei bot.
+* **`TIMEOUT_SECONDS` (96 Hours):** Subscriptions have a Time-To-Live of 4 days (`4 * 24 * 3600`). Once this threshold is reached, the user is automatically unsubscribed if they do not renew by sending `/sub` again. This prevents spamming inactive accounts.
 * **Memory Pruning (30 Minutes):** To prevent memory leaks, abandoned inline-keyboard callbacks and incomplete user interaction states are automatically purged from RAM every 30 minutes.
-* **Database Trimming:** To prevent storage bloat, the Garbage Collector (`trim_tracked_items()`) automatically limits the saved history to the last 30 items per active search category/keyword.
+* **Database Trimming:** To prevent storage bloat, the Garbage Collector (`trim_tracked_items()`) automatically limits the saved history to the last 30 items per active search category/keyword. Orphaned links from deleted categories are automatically pruned during the regular database trim cycle. Empty categories are immediately deleted from the JSON state upon keyword removal.
 
 ## License
 This project is licensed under the **GNU General Public License v3 (GPLv3)**. 
