@@ -30,6 +30,7 @@ Monitora automaticamente le tue ricerche su Subito.it e ricevi aggiornamenti via
 
 ## ⚙️ Core Features
 
+* **Interactive Telegram UI:** Fully manage your searches, categories, and keywords directly from the chat using inline keyboards and guided setup flows.
 * **Asynchronous Polling:** Separated scraping and Telegram API threads for zero-latency command processing.
 * **Long Polling Telegram:** Reduces network traffic by keeping HTTP connections open for 60 seconds to Telegram servers.
 * **WAF Resilience & Session Isolation:** Uses a dedicated Chromium-spoofed `requests.Session` exclusively for querying Subito.it to mitigate IP bans (HTTP 403/429), while using pure `requests` for the Telegram API and CDN image fetching to prevent header-based rejections (HTTP 400).
@@ -41,9 +42,9 @@ Monitora automaticamente le tue ricerche su Subito.it e ricevi aggiornamenti via
 ## 🛠 Installation
 
 1. Clone the repository and navigate to the directory.
-2. Install the required dependencies:
+2. Install the required dependencies (using `uv` is recommended):
    ```bash
-   pip install requests beautifulsoup4 python-dotenv
+   uv pip install requests beautifulsoup4 python-dotenv curl_cffi pillow
    ```
 3. Create a `.env` file in the project root and insert the token provided by BotFather:
    ```env
@@ -52,16 +53,18 @@ Monitora automaticamente le tue ricerche su Subito.it e ricevi aggiornamenti via
 
 ## 📁 Search Configuration (`searches.json`)
 
-Create a `searches.json` file in the project root. The structure must strictly follow the JSON format with two levels of nesting: `{"Search_Name": {"Keyword": "Full_URL"}}`.
+**The bot automatically generates and manages the `searches.json` file through the interactive Telegram commands (`/add` and `/rm`). You do not need to create or edit this file manually.**
+
+However, if you prefer manual configuration, the structure must strictly follow the JSON format with two levels of nesting: `{"Search_Name": {"Keyword": "Full_URL"}}`.
 
 ```json
 {
   "Electronics": {
-    "Macbook Air M1": "https://www.subito.it/annunci-italia/vendita/usato/?q=macbook+air+m1",
-    "iPhone 13 Pro": "https://www.subito.it/annunci-italia/vendita/usato/?q=iphone+13+pro"
+    "Macbook Air M1": "[https://www.subito.it/annunci-italia/vendita/usato/?q=macbook+air+m1](https://www.subito.it/annunci-italia/vendita/usato/?q=macbook+air+m1)",
+    "iPhone 13 Pro": "[https://www.subito.it/annunci-italia/vendita/usato/?q=iphone+13+pro](https://www.subito.it/annunci-italia/vendita/usato/?q=iphone+13+pro)"
   },
   "Vehicles": {
-    "Honda SH 150": "https://www.subito.it/annunci-italia/vendita/moto-e-scooter/?q=honda+sh+150"
+    "Honda SH 150": "[https://www.subito.it/annunci-italia/vendita/moto-e-scooter/?q=honda+sh+150](https://www.subito.it/annunci-italia/vendita/moto-e-scooter/?q=honda+sh+150)"
   }
 }
 ```
@@ -73,17 +76,18 @@ The program runs continuously in daemon mode by default. Its behavior is governe
 
 * `-r`, `--refreshrate [SECONDS]`: Sets the wait time between two complete scraping cycles. Default is `120`.
 * `-d`, `--debug`: Enables verbose logging for HTTP request tracking, CDN schema dumps, and Telegram API payloads.
+* `-s`, `--skip`: Skips sending notifications for pre-existing ads during the very first startup scan.
 
 **Startup Examples:**
 ```bash
 # Standard startup with a check every 2 minutes
-python subito_telegram_bot.py
+uv run main.py
 
 # Startup with a check every 60 seconds
-python subito_telegram_bot.py -r 60
+uv run main.py -r 60
 
-# Startup with a 30-second delay and debug output enabled
-python subito_telegram_bot.py --refreshrate 30 --debug
+# Startup with a 30-second delay, debug output enabled, skipping old ads
+uv run main.py --refreshrate 30 --debug --skip
 ```
 
 ## 📱 Telegram Commands
@@ -92,7 +96,9 @@ User interaction occurs via direct chat with the bot.
 
 * `/sub` or `/start`: Subscribes the user and starts receiving notifications.
 * `/unsub`: Unsubscribes the user and removes the Chat ID from the database.
-* `/search`: Prints the hierarchical list of active searches currently in the JSON file.
+* `/search`: Prints the hierarchical list of active searches currently in the database, navigable via inline buttons.
+* `/add <link>`: Starts an interactive flow to add a new search. You will be guided to select/create a category and set a keyword. **Note:** The link must be a valid Subito.it URL strictly pointing to the `/annunci-italia/vendita/` path.
+* `/rm <keyword>`: Removes an existing search via an interactive confirmation menu. Empty categories are automatically cleaned up.
 * `/status`: Displays the number of active users and the system uptime (hours, minutes, seconds).
 * `/help`: Displays the command guide.
 
@@ -100,14 +106,10 @@ User interaction occurs via direct chat with the bot.
 
 The program implements automatic maintenance logic with static parameters defined in the source code.
 
-* **`retention_period` (36 Hours):** Found inside the `manage_message_deletions()` function (`36 * 60 * 60`). The bot tracks sent `message_id`s and automatically deletes them after 36 hours to keep the chat history clean.
 * **`MAX_SUBSCRIBERS` (15):** To prevent Telegram API rate-limiting during broadcasts, the system accepts a maximum of 15 simultaneous users.
-* **`WARNING_SECONDS` (48 Hours):** Defines the elapsed time (`2 * 24 * 3600`) after which the system sends a 1-day expiration warning to the subscriber.
-* **`TIMEOUT_SECONDS` (72 Hours):** Subscriptions have a Time-To-Live of 3 days (`3 * 24 * 3600`). Once this threshold is reached, the user is automatically unsubscribed if they do not renew by sending `/sub` again. This prevents spamming inactive accounts.
-* **`TTL_30_DAYS` (30 Days):** Processed listing URLs are saved in `tracked_items.json` to avoid duplicate alerts. To prevent memory leaks, the Garbage Collector (`garbage_collect_tracking()`) uses this threshold (`30 * 24 * 3600`) to automatically purge records older than 30 days from the local database.
-* **`MAX_BACKOFF` (32x):** Found inside `run_scraper()`. If the IP is blocked by Subito.it (HTTP 403/429), the standard `--refreshrate` is progressively multiplied (x2, x4, x8, x16) up to a maximum of 32 times. This Exponential Backoff allows the IP to restore its reputation on the target's firewalls.
-* **`is_new_query` (Zero-notification initialization):** A boolean flag logic inside `run_scraper()`. When a new URL is added to `searches.json`, the very first scan of that link silently populates the database with existing listings, bypassing the broadcast block to avoid flooding users with old alerts.
+* **Database Trimming:** To prevent memory bloat, the Garbage Collector (`trim_tracked_items()`) automatically limits the saved history to the last 30 items per active search category/keyword. 
+* **Auto-Cleanup:** Orphaned links from deleted categories are automatically pruned during the regular database trim cycle. Empty categories are immediately deleted from the JSON state upon keyword removal.
 
 ## License
-This project is licensed under the **GNU Affero General Public License v3 (AGPLv3)**. 
+This project is licensed under the **GNU General Public License v3 (GPLv3)**. 
 See the `LICENSE` file for full details.

@@ -1,6 +1,6 @@
 """
 Filename: telegram_ui.py
-Version: 3.2.0
+Version: 3.3.0
 Date: 2026-04-28
 Author: Leonardo Lisa
 Description: Standardized Telegram Bot Controller. Accurately restores the original 
@@ -16,6 +16,7 @@ the Free Software Foundation, either version 3 of the License, or
 """
 
 from curl_cffi import requests as cffi_requests
+import requests
 import time
 import html
 import uuid
@@ -24,7 +25,10 @@ import re
 from urllib.parse import urlparse
 
 class TelegramUI:
-    def __init__(self, token, db, shutdown_event, max_subs=15):
+    # Subscription duration: 96 hours
+    TIMEOUT_SECONDS = 4 * 24 * 3600
+
+    def __init__(self, token, db, shutdown_event, max_subs=2):
         self.token = token
         self.db = db
         self.shutdown_event = shutdown_event
@@ -41,12 +45,17 @@ class TelegramUI:
         return f"cb_{cb_id}"
 
     def _is_valid_subito_url(self, url):
-        """Strictly validates if the provided URL is a valid Subito.it link."""
+        """Strictly validates if the provided URL is a valid Subito.it link with the correct path."""
+        # Normalize URL to always have a scheme for proper parsing
+        if not url.startswith("http://") and not url.startswith("https://"):
+            url = "https://" + url
+            
         try:
             parsed = urlparse(url)
-            if parsed.scheme != "https": return False
+            if parsed.scheme not in ["http", "https"]: return False
             if parsed.netloc not in ["www.subito.it", "subito.it"]: return False
-            if not parsed.path.startswith("/"): return False
+            # Force the path to start strictly with /annunci-italia/vendita/
+            if not parsed.path.startswith("/annunci-italia/vendita/"): return False
             return True
         except Exception:
             return False
@@ -159,19 +168,24 @@ class TelegramUI:
             chat_id = str(update["message"]["chat"]["id"])
             text = update["message"]["text"].strip()
             
+            # Abort pending state if a new command is issued
+            if text.startswith("/") and chat_id in self.user_states:
+                with self.db.lock:
+                    del self.user_states[chat_id]
+            
             if text in ["/start", "/sub"]:
                 with self.db.lock:
+                    days = self.TIMEOUT_SECONDS
                     if chat_id not in self.db.subscribers:
                         if len(self.db.subscribers) >= self.max_subs:
-                            self.send_direct_message(chat_id, f"⚠️ System full. Maximum {self.max_subs} active subscribers allowed.")
+                            self.send_direct_message(chat_id, f"⚠️ System full. Max {self.max_subs} users.")
                         else:
                             self.db.subscribers[chat_id] = {"joined": time.time(), "notified": False}
-                            self.send_direct_message(chat_id, "✅ Subscription active. It will expire in 3 days. Send /sub again to renew.")
-                            print(f"\033[92m[TG] New subscriber added: {chat_id}\033[0m")
+                            self.send_direct_message(chat_id, f"✅ Subscription active for {days} days.")
                     else:
                         self.db.subscribers[chat_id]["joined"] = time.time()
                         self.db.subscribers[chat_id]["notified"] = False
-                        self.send_direct_message(chat_id, "✅ Subscription renewed for another 3 days.")
+                        self.send_direct_message(chat_id, f"✅ Subscription renewed for {days} days.")
                 
             elif text == "/unsub":
                 with self.db.lock:
@@ -201,8 +215,14 @@ class TelegramUI:
                 
                 link = parts[1].strip()
                 if not self._is_valid_subito_url(link):
-                    self.send_direct_message(chat_id, "⚠️ <b>Error:</b> Invalid link. You must provide a valid https://www.subito.it URL.")
+                    self.send_direct_message(chat_id, "⚠️ <b>Error:</b> Invalid link. You must provide a valid Subito.it URL starting with /annunci-italia/vendita/.")
                     return
+                    
+                # Normalize link formatting before saving
+                if not link.startswith("http://") and not link.startswith("https://"):
+                    link = "https://" + link
+                elif link.startswith("http://"):
+                    link = link.replace("http://", "https://", 1)
                     
                 # Synchronous HTTP validation via curl_cffi to bypass WAF
                 try:
@@ -300,8 +320,11 @@ class TelegramUI:
                     
                 if state_data["state"] == "waiting_new_cat_name":
                     new_cat = text.strip()
-                    if len(new_cat) > 30 or not re.match(r'^[a-zA-Z0-9\s\-]+$', new_cat):
-                        self.send_direct_message(chat_id, "⚠️ <b>Error:</b> Invalid format. Only letters, numbers, spaces, or dashes are allowed (max 30 chars). Try again.")
+                    # Splitted validation to report exact reason for failure
+                    if len(new_cat) > 30:
+                        self.send_direct_message(chat_id, "⚠️ <b>Error:</b> Category name is too long (maximum 30 characters). Try again.")
+                    elif not re.match(r'^[a-zA-Z0-9\s\-]+$', new_cat):
+                        self.send_direct_message(chat_id, "⚠️ <b>Error:</b> Category name contains invalid characters. Only alphanumeric characters, spaces, and hyphens are allowed. Try again.")
                     else:
                         with self.db.lock:
                             self.user_states[chat_id]["state"] = "waiting_keyword"
@@ -405,7 +428,9 @@ class TelegramUI:
                     with self.db.lock:
                         if cat in self.db.searches and kw in self.db.searches[cat]:
                             del self.db.searches[cat][kw]
-                            if not self.db.searches[cat]: del self.db.searches[cat]
+                            # Auto-Cleanup: Remove category entirely if no keywords are left
+                            if not self.db.searches[cat]: 
+                                del self.db.searches[cat]
                     try: requests.post(edit_url, json={"chat_id": chat_id, "message_id": message_id, "text": f"✅ Search <b>{html.escape(kw)}</b> successfully deleted.", "parse_mode": "HTML"}, timeout=5)
                     except Exception: pass
 
