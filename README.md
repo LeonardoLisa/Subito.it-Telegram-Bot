@@ -32,8 +32,8 @@ Monitora automaticamente le tue ricerche su Subito.it e ricevi aggiornamenti via
 
 * **Interactive Telegram UI:** Fully manage your searches, categories, and keywords directly from the chat using inline keyboards and guided setup flows.
 * **Asynchronous Polling:** Separated scraping and Telegram API threads for zero-latency command processing.
+* **WAF Resilience & Exponential Backoff:** Uses a dedicated Chromium-spoofed `requests.Session` exclusively for querying Subito.it. In case of temporary IP bans (HTTP 403), the system automatically performs up to 3 retries, doubling the wait time at each failure, before proceeding.
 * **Long Polling Telegram:** Reduces network traffic by keeping HTTP connections open for 60 seconds to Telegram servers.
-* **WAF Resilience & Session Isolation:** Uses a dedicated Chromium-spoofed `requests.Session` exclusively for querying Subito.it to mitigate IP bans (HTTP 403/429), while using pure `requests` for the Telegram API and CDN image fetching to prevent header-based rejections (HTTP 400).
 * **Instant Graceful Teardown:** The main loop utilizes a 1-second interruptible sleep cycle. Upon receiving a `SIGINT` (Ctrl+C) or `SIGTERM`, the daemon immediately halts the sleep cycle, safely saves the state, and broadcasts an offline message without waiting for the refresh delay to naturally expire.
 * **Atomic Writes:** JSON file I/O is managed via `os.replace` on temporary files, ensuring immunity to data corruption during crashes or power losses.
 * **Native Photo Broadcasting:** Dynamically resolves Subito's `cdnBaseUrl` via query string API rules (`?rule=gallery-desktop-1x-auto`) to download the highest quality JPEG directly into RAM and broadcast it using Telegram's native `sendPhoto` `multipart/form-data` endpoint.
@@ -60,15 +60,10 @@ However, if you prefer manual configuration, the structure must strictly follow 
 ```json
 {
   "Electronics": {
-    "Macbook Air M1": "[https://www.subito.it/annunci-italia/vendita/usato/?q=macbook+air+m1](https://www.subito.it/annunci-italia/vendita/usato/?q=macbook+air+m1)",
-    "iPhone 13 Pro": "[https://www.subito.it/annunci-italia/vendita/usato/?q=iphone+13+pro](https://www.subito.it/annunci-italia/vendita/usato/?q=iphone+13+pro)"
-  },
-  "Vehicles": {
-    "Honda SH 150": "[https://www.subito.it/annunci-italia/vendita/moto-e-scooter/?q=honda+sh+150](https://www.subito.it/annunci-italia/vendita/moto-e-scooter/?q=honda+sh+150)"
+    "Macbook Air M1": "[https://www.subito.it/annunci-italia/vendita/usato/?q=macbook+air+m1](https://www.subito.it/annunci-italia/vendita/usato/?q=macbook+air+m1)"
   }
 }
 ```
-*Note: Modifications to this file are read at runtime during the next scraping cycle. Restarting the daemon is not required.*
 
 ## 🚀 CLI Usage
 
@@ -96,10 +91,11 @@ User interaction occurs via direct chat with the bot.
 
 * `/sub` or `/start`: Subscribes the user and starts receiving notifications.
 * `/unsub`: Unsubscribes the user and removes the Chat ID from the database.
-* `/search`: Prints the hierarchical list of active searches currently in the database, navigable via inline buttons.
+* `/search`: Prints the hierarchical list of active searches currently in the database.
 * `/add <link>`: Starts an interactive flow to add a new search. You will be guided to select/create a category and set a keyword. **Note:** The link must be a valid Subito.it URL strictly pointing to the `/annunci-italia/vendita/` path.
-* `/rm <keyword>`: Removes an existing search via an interactive confirmation menu. Empty categories are automatically cleaned up.
-* `/status`: Displays the number of active users and the system uptime (hours, minutes, seconds).
+* `/rm <keyword>`: Removes an existing search via an interactive confirmation menu.
+* `/status`: Displays the number of active users and the system uptime formatted in years, months, days, hours, and minutes.
+* `🛑 /cancel`: Instantly aborts the current action (e.g., waiting for keyword input) and resets the user's state.
 * `/help`: Displays the command guide.
 
 ## ⏱ Internal Parameters (System Mechanics)
@@ -107,8 +103,10 @@ User interaction occurs via direct chat with the bot.
 The program implements automatic maintenance logic with static parameters defined in the source code.
 
 * **`MAX_SUBSCRIBERS` (15):** To prevent Telegram API rate-limiting during broadcasts, the system accepts a maximum of 15 simultaneous users.
-* **Database Trimming:** To prevent memory bloat, the Garbage Collector (`trim_tracked_items()`) automatically limits the saved history to the last 30 items per active search category/keyword. 
-* **Auto-Cleanup:** Orphaned links from deleted categories are automatically pruned during the regular database trim cycle. Empty categories are immediately deleted from the JSON state upon keyword removal.
+* **`TIMEOUT_SECONDS` (96 Hours):** Subscriptions have a Time-To-Live of 4 days (`4 * 24 * 3600`). Once this threshold is reached, the user is automatically unsubscribed if they do not renew by sending `/sub` again.
+* **WAF Exponential Backoff:** In caso di blocco IP (HTTP 403), il sistema effettua fino a 3 tentativi di retry, raddoppiando il tempo di attesa a ogni fallimento (es. 5s, 10s, 20s) prima di saltare l'annuncio. Include anche un jitter randomico (2.5 - 5.5s) tra una query e l'altra per eludere il riconoscimento dei bot.
+* **Memory Pruning (30 Minutes):** To prevent memory leaks, abandoned inline-keyboard callbacks and incomplete user interaction states are automatically purged from RAM every 30 minutes.
+* **Database Trimming:** To prevent storage bloat, the Garbage Collector (`trim_tracked_items()`) automatically limits the saved history to the last 30 items per active search category/keyword.
 
 ## License
 This project is licensed under the **GNU General Public License v3 (GPLv3)**. 

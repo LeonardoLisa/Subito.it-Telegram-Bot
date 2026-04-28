@@ -1,11 +1,11 @@
 """
 Filename: main.py
 Version: 3.5.0
-Date: 2026-04-28
+Date: 2026-04-29
 Author: Leonardo Lisa
 Description: Main orchestration daemon. Links Database, Scraper, and Telegram UI.
-             Restores original CLI flags (--refreshrate, --debug, --skip), terminal UI formatting,
-             and graceful teardown / interruptible sleep logic.
+             Implements TCP DNS connectivity checks, debug logging, and
+             dynamic subscription expiration monitoring.
 Requirements: requests beautifulsoup4 pillow python-dotenv curl-cffi
 
 GNU GPLv3 Prelude:
@@ -13,139 +13,179 @@ This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
 the Free Software Foundation, either version 3 of the License, or
 (at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-from curl_cffi import requests as cffi_requests
-import requests
+import argparse
+import os
+import sys
 import time
+import signal
+import threading
 import html
-import uuid
-import json
-import re
-from urllib.parse import urlparse
+import socket
+from datetime import datetime
+from dotenv import load_dotenv
 
-class TelegramUI:
-    # Configurable duration
-    TIMEOUT_SECONDS = 4 * 24 * 3600  # 96 hours
-    CACHE_PRUNE_INTERVAL = 1800      # 30 minutes
+from database import Database
+from scraper_subito import SubitoScraper
+from telegram_ui import TelegramUI
 
-    def __init__(self, token, db, shutdown_event, max_subs=15):
-        self.token = token
-        self.db = db
-        self.shutdown_event = shutdown_event
-        self.max_subs = max_subs
-        self.debug_mode = False
-        self.user_states = {}
-        self.callback_cache = {}
-        self.start_time = time.time()
-        self.last_cache_prune = time.time()
-        
-    def _debug_print(self, error_msg):
-        if self.debug_mode:
-            print(f"\033[91m[TG_UI ERROR] {error_msg}\033[0m")
+class Colors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
 
-    def _get_uptime_string(self):
-        """Formats uptime into Year, Month, Day, Hour, Minute."""
-        delta = int(time.time() - self.start_time)
-        y, rem = divmod(delta, 31536000)
-        mo, rem = divmod(rem, 2592000)
-        d, rem = divmod(rem, 86400)
-        h, rem = divmod(rem, 3600)
-        m, _ = divmod(rem, 60)
-        
-        parts = []
-        if y > 0: parts.append(f"{y}y")
-        if mo > 0: parts.append(f"{mo}mo")
-        
-        # If days exist, show H and M even if zero (e.g., 5d 0h 0m)
-        if d > 0:
-            parts.extend([f"{d}d", f"{h}h", f"{m}m"])
-        else:
-            if h > 0: parts.append(f"{h}h")
-            if m > 0 or not parts: parts.append(f"{m}m")
-            
-        return " ".join(parts)
+DEBUG_MODE = False
 
-    def _prune_internal_memory(self):
-        """Memory Leak Prevention: Prunes states and callbacks older than 30 min."""
-        now = time.time()
-        with self.db.lock:
-            # Prune callback cache
-            stale_cbs = [k for k, v in self.callback_cache.items() if now - v.get("timestamp", 0) > 1800]
-            for k in stale_cbs: del self.callback_cache[k]
-            
-            # Prune abandoned user states
-            stale_states = [k for k, v in self.user_states.items() if now - v.get("timestamp", 0) > 1800]
-            for k in stale_states: del self.user_states[k]
-        
-        self.last_cache_prune = now
+def log(msg, color=Colors.ENDC):
+    timestamp = datetime.now().strftime('%H:%M:%S')
+    print(f"{color}[{timestamp}] {msg}{Colors.ENDC}")
 
-    def _create_callback_data(self, payload):
-        cb_id = str(uuid.uuid4())[:8]
-        with self.db.lock:
-            payload["timestamp"] = time.time()
-            self.callback_cache[cb_id] = payload
-        return f"cb_{cb_id}"
+def debug_log(msg, color=Colors.OKCYAN):
+    if DEBUG_MODE:
+        log(f"DEBUG: {msg}", color)
 
-    def send_direct_message(self, chat_id, text, reply_markup=None):
-        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-        payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
-        if reply_markup: payload["reply_markup"] = reply_markup
-        try:
-            res = requests.post(url, json=payload, timeout=10)
-            if not res.json().get("ok"): self._debug_print(res.text)
-        except Exception as e: self._debug_print(str(e))
+def is_network_online(host="1.1.1.1", port=53, timeout=3):
+    try:
+        socket.setdefaulttimeout(timeout)
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect((host, port))
+        return True
+    except socket.error:
+        return False
 
-    def poll_updates(self):
-        url = f"https://api.telegram.org/bot{self.token}/getUpdates"
-        while not self.shutdown_event.is_set():
-            if time.time() - self.last_cache_prune > self.CACHE_PRUNE_INTERVAL:
-                self._prune_internal_memory()
+shutdown_event = threading.Event()
+sigint_count = 0
 
-            payload = {"offset": int(self.db.last_update_id) + 1, "timeout": 60}
-            try:
-                res = requests.post(url, json=payload, timeout=65).json()
-                if res.get("ok") and res["result"]:
-                    for update in res["result"]:
-                        with self.db.lock: self.db.last_update_id = update["update_id"]
-                        self._process_update(update)
-                    self.db.save_all()
-            except Exception as e:
-                self._debug_print(str(e))
-                time.sleep(2)
+def signal_handler(signum, frame):
+    global sigint_count
+    sigint_count += 1
+    if sigint_count >= 2:
+        log("\nForced exit requested. Terminating immediately.", Colors.FAIL)
+        os._exit(1)
 
-    def _process_update(self, update):
-        if "message" in update and "text" in update["message"]:
-            chat_id = str(update["message"]["chat"]["id"])
-            text = update["message"]["text"].strip()
-            
-            # Global command override
-            if text == "/cancel":
-                with self.db.lock: self.user_states.pop(chat_id, None)
-                self.send_direct_message(chat_id, "❌ <b>Action cancelled.</b>")
-                return
+    log("\nTermination requested. Waiting for safe teardown...", Colors.WARNING)
+    shutdown_event.set()
 
-            if text.startswith("/") and chat_id in self.user_states:
-                with self.db.lock: del self.user_states[chat_id]
+def check_subscriptions(db, timeout_seconds):
+    now = time.time()
+    expired_users = []
+    with db.lock:
+        for chat_id, info in list(db.subscribers.items()):
+            joined_time = info.get("joined", 0)
+            if now - joined_time > timeout_seconds:
+                expired_users.append(chat_id)
+        for chat_id in expired_users:
+            del db.subscribers[chat_id]
+    return expired_users
 
-            if text in ["/start", "/sub"]:
-                days = self.TIMEOUT_SECONDS // 86400
-                with self.db.lock:
-                    self.db.subscribers[chat_id] = {"joined": time.time(), "notified": False}
-                self.send_direct_message(chat_id, f"✅ Subscription active for {days} days.")
-                
-            elif text == "/status":
-                with self.db.lock: count = len(self.db.subscribers)
-                uptime = self._get_uptime_string()
-                self.send_direct_message(chat_id, f"📊 <b>Status</b>\nUsers: {count}/{self.max_subs}\nUptime: {uptime}")
+def format_message(search_name, keyword, ad):
+    desc = ad['description'][:200] + '...' if len(ad['description']) > 200 else ad['description']
+    return (
+        f"📂 <b>{html.escape(search_name)}</b> | 🔍 <i>{html.escape(keyword)}</i>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>{html.escape(ad['title'])}</b>\n"
+        f"💶 Price: € {html.escape(ad['price'])}\n"
+        f"📍 Location: {html.escape(ad['location'])}\n\n"
+        f"📝 <i>{html.escape(desc)}</i>"
+    )
 
-            # ... [Rest of command logic: /search, /add, /rm as in version 3.4.0] ...
-            # Ensure any waiting state logic (waiting_keyword, etc.) uses self.user_states[chat_id]["timestamp"] = time.time()
+def main():
+    global DEBUG_MODE
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    parser = argparse.ArgumentParser(description="Subito.it Scraper Daemon")
+    parser.add_argument('--refreshrate', '-r', type=int, default=120, help="Scan interval")
+    parser.add_argument('--debug', '-d', action='store_true', help="Enable verbose logging")
+    parser.add_argument('--skip', '-s', action='store_true', help="Skip initial notifications")
+    args = parser.parse_args()
+
+    DEBUG_MODE = args.debug
+
+    load_dotenv()
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        log("ERROR: TELEGRAM_BOT_TOKEN missing in .env", Colors.FAIL)
+        sys.exit(1)
+
+    db = Database()
+    db.debug_mode = DEBUG_MODE
+    
+    scraper = SubitoScraper()
+    scraper.debug_mode = DEBUG_MODE
+    
+    tg = TelegramUI(token, db, shutdown_event)
+    tg.debug_mode = DEBUG_MODE
+
+    log("Starting Telegram thread...", Colors.OKCYAN)
+    threading.Thread(target=tg.poll_updates, daemon=True).start()
+
+    tg.broadcast("🟢 <b>System Online</b>")
+    skip_next = args.skip
+
+    while not shutdown_event.is_set():
+        if not is_network_online():
+            log("Network offline. Retrying in 10s...", Colors.FAIL)
+            time.sleep(10)
+            continue
+
+        days_valid = tg.TIMEOUT_SECONDS // 86400
+        expired = check_subscriptions(db, tg.TIMEOUT_SECONDS)
+        for chat_id in expired:
+            debug_log(f"Expiring session for {chat_id}")
+            tg.send_direct_message(chat_id, f"⚠️ <b>Subscription Expired</b>\nYour {days_valid}-day access has ended. Send /sub to renew.")
+
+        with db.lock:
+            searches_copy = {c: kw.copy() for c, kw in db.searches.items()}
+
+        for category, keywords in searches_copy.items():
+            if shutdown_event.is_set(): break
+            for keyword, url in keywords.items():
+                if shutdown_event.is_set(): break
+
+                with db.lock:
+                    is_new_url = url not in db.known_urls
+                    if is_new_url: db.known_urls.append(url)
+
+                log(f"Scanning: {category} -> {keyword}", Colors.OKBLUE)
+                ads = scraper.fetch_ads(url)
+
+                for ad in ads:
+                    with db.lock: is_tracked = ad['link'] in db.tracked_items
+                    if not is_tracked:
+                        if not skip_next and not is_new_url:
+                            img = scraper.download_image(ad['image_url'])
+                            msg = format_message(category, keyword, ad)
+                            tg.broadcast(msg, img, ad['link'])
+
+                        db.add_tracked_item(ad['link'], ad['title'], ad['price'], category, keyword)
+                time.sleep(1)
+
+        db.trim_tracked_items(max_items=30)
+        db.save_all()
+        skip_next = False
+
+        if not shutdown_event.is_set():
+            log(f"Sleeping {args.refreshrate}s...", Colors.HEADER)
+            slept = 0
+            while slept < args.refreshrate and not shutdown_event.is_set():
+                time.sleep(1)
+                slept += 1
+
+    try:
+        tg.broadcast("🔴 <b>System Offline</b>")
+        db.save_all()
+    except Exception as e:
+        log(f"Teardown error: {e}", Colors.FAIL)
+    finally:
+        log("Teardown complete.", Colors.BOLD)
+        sys.exit(0)
+
+if __name__ == "__main__":
+    main()
