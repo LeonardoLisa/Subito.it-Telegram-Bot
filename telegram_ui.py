@@ -27,7 +27,7 @@ import html
 import uuid
 import json
 import re
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
 class TelegramUI:
     TIMEOUT_SECONDS = 4 * 24 * 3600  # 96 hours
@@ -122,7 +122,7 @@ class TelegramUI:
         except Exception as e:
             self._debug_print(f"Direct Msg Net Error: {e}")
 
-    def broadcast(self, msg_text, image_bytes=None, item_url=None):
+    def broadcast(self, msg_text, image_bytes=None, item_url=None, show_delete=True):
         with self.db.lock:
             subs = list(self.db.subscribers.keys())
         if not subs: return
@@ -130,15 +130,18 @@ class TelegramUI:
         reply_markup = {"inline_keyboard": []}
         if item_url:
             reply_markup["inline_keyboard"].append([{"text": "🛒 Go to Ad", "url": item_url}])
-        reply_markup["inline_keyboard"].append([{"text": "🗑️ Delete", "callback_data": "delete_msg"}])
-        reply_markup_json = json.dumps(reply_markup)
+        if show_delete:
+            reply_markup["inline_keyboard"].append([{"text": "🗑️ Delete", "callback_data": "delete_msg"}])
+            
+        reply_markup_json = json.dumps(reply_markup) if reply_markup["inline_keyboard"] else None
 
         for chat_id in subs:
             try:
                 sent = False
                 if image_bytes:
                     url = f"https://api.telegram.org/bot{self.token}/sendPhoto"
-                    payload = {"chat_id": chat_id, "caption": msg_text[:1024], "parse_mode": "HTML", "reply_markup": reply_markup_json}
+                    payload = {"chat_id": chat_id, "caption": msg_text[:1024], "parse_mode": "HTML"}
+                    if reply_markup_json: payload["reply_markup"] = reply_markup_json
                     files = {"photo": ("image.jpg", image_bytes, "image/jpeg")}
                     res = requests.post(url, data=payload, files=files, timeout=15)
                     data = res.json()
@@ -149,7 +152,8 @@ class TelegramUI:
 
                 if not sent:
                     url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-                    payload = {"chat_id": chat_id, "text": msg_text, "parse_mode": "HTML", "disable_web_page_preview": True, "reply_markup": reply_markup_json}
+                    payload = {"chat_id": chat_id, "text": msg_text, "parse_mode": "HTML", "disable_web_page_preview": True}
+                    if reply_markup_json: payload["reply_markup"] = reply_markup_json
                     res = requests.post(url, json=payload, timeout=10)
                     data = res.json()
                     if not data.get("ok"):
@@ -249,6 +253,13 @@ class TelegramUI:
                     link = "https://" + link
                 elif link.startswith("http://"):
                     link = link.replace("http://", "https://", 1)
+                
+                # Automatically enforce &order=datedesc parameter
+                parsed_link = urlparse(link)
+                query_params = dict(parse_qsl(parsed_link.query))
+                query_params['order'] = 'datedesc'
+                new_query = urlencode(query_params)
+                link = urlunparse((parsed_link.scheme, parsed_link.netloc, parsed_link.path, parsed_link.params, new_query, parsed_link.fragment))
                     
                 try:
                     check_res = cffi_requests.get(
