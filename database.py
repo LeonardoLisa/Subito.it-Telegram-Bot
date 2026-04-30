@@ -92,7 +92,7 @@ class Database:
             self._atomic_save(self.searches, self.search_file)
             self._atomic_save(self.known_urls, self.url_file)
 
-    def trim_tracked_items(self, max_items=30):
+    def trim_tracked_items(self, max_items=150):
         """Retains only the latest N items per search category/keyword to prevent database bloat."""
         with self.lock:
             grouped = {}
