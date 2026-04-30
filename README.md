@@ -104,9 +104,13 @@ User interaction occurs via direct chat with the bot.
 The program implements automatic maintenance logic with static parameters defined in the source code.
 
 * **`MAX_SUBSCRIBERS` (15):** To prevent Telegram API rate-limiting during broadcasts, the system accepts a maximum of 15 simultaneous users.
-* **`TIMEOUT_SECONDS` (96 Hours):** Subscriptions have a Time-To-Live of 4 days (`4 * 24 * 3600`). Once this threshold is reached, the user is automatically unsubscribed if they do not renew by sending `/sub` again. This prevents spamming inactive accounts. See `telegram_ui.py`, line 33. See `telegram_ui.py`, line 36.
-* **Memory Pruning (30 Minutes):** To prevent memory leaks, abandoned inline-keyboard callbacks and incomplete user interaction states are automatically purged from RAM every 30 minutes. See `telegram_ui.py`, line 34.
-* **Database Trimming:** To prevent storage bloat, the Garbage Collector (`trim_tracked_items()`) automatically limits the saved history to the last 30 items per active search category/keyword. Orphaned links from deleted categories are automatically pruned during the regular database trim cycle. Empty categories are immediately deleted from the JSON state upon keyword removal. See `database.py`, line 91.
+   See `telegram_ui.py`, line 36.
+* **`TIMEOUT_SECONDS` (96 Hours):** Subscriptions have a Time-To-Live of 4 days (`4 * 24 * 3600`). Once this threshold is reached, the user is automatically unsubscribed if they do not renew by sending `/sub` again. This prevents spamming inactive accounts.
+  See `telegram_ui.py`, line 33.
+* **Memory Pruning (30 Minutes):** To prevent memory leaks, abandoned inline-keyboard callbacks and incomplete user interaction states are automatically purged from RAM every 30 minutes.
+  See `telegram_ui.py`, line 34.
+* **Database Trimming:** To prevent storage bloat, the Garbage Collector (`trim_tracked_items()`) automatically limits the saved history to the last 30 items per active search category/keyword. Orphaned links from deleted categories are automatically pruned during the regular database trim cycle. Empty categories are immediately deleted from the JSON state upon keyword removal.
+  See `database.py`, line 91.
 
 ## License
 This project is licensed under the **GNU General Public License v3 (GPLv3)**. 
