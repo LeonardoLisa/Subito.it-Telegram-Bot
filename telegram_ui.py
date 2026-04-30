@@ -33,7 +33,7 @@ class TelegramUI:
     TIMEOUT_SECONDS = 4 * 24 * 3600  # 96 hours
     CACHE_PRUNE_INTERVAL = 1800      # 30 minutes
 
-    def __init__(self, token, db, shutdown_event, max_subs=15):
+    def __init__(self, token, db, shutdown_event, max_subs=1):
         self.token = token
         self.db = db
         self.shutdown_event = shutdown_event
