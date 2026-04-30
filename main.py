@@ -128,7 +128,7 @@ def main():
     log("Starting Telegram thread...", Colors.OKCYAN)
     threading.Thread(target=tg.poll_updates, daemon=True).start()
 
-    tg.broadcast("🟢 <b>System Online</b>")
+    tg.broadcast("🟢 <b>System Online</b>", show_delete=False)
     skip_next = args.skip
 
     while not shutdown_event.is_set():
@@ -185,7 +185,7 @@ def main():
                 slept += 1
 
     try:
-        tg.broadcast("🔴 <b>System Offline</b>")
+        tg.broadcast("🔴 <b>System Offline</b>", show_delete=False)
         db.save_all()
     except Exception as e:
         log(f"Teardown error: {e}", Colors.FAIL)
