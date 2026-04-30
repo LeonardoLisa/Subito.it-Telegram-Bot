@@ -1,9 +1,9 @@
 """
 Filename: scraper_subito.py
-Version: 3.1.0
-Date: 2026-04-28
+Version: 3.3.0
+Date: 2026-04-29
 Author: Leonardo Lisa
-Description: Target-specific Web Scraper for Subito.it. Implements WAF evasion (Safari 15.3), Next.js JSON parsing, and image extraction.
+Description: Target-specific Web Scraper for Subito.it. Implements WAF evasion, randomized exponential backoff retries, and image extraction.
 Requirements: curl_cffi, beautifulsoup4, pillow
 
 GNU GPLv3 Prelude:
@@ -22,9 +22,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 import json
+import time
+import random
 from curl_cffi import requests as cffi_requests
 from bs4 import BeautifulSoup
-import time
 from PIL import Image
 from io import BytesIO
 
@@ -32,7 +33,10 @@ class SubitoScraper:
     def __init__(self):
         self.base_url = "https://www.subito.it/"
         self.debug_mode = False
-        # Safari 15.3 footprint effectively bypasses DataDome HTTP 403 blocks
+        self._reset_session()
+
+    def _reset_session(self):
+        """Initializes or resets the HTTP session to clear tainted cookies."""
         self.session = cffi_requests.Session(impersonate="safari15_3")
         self.session.headers.update({
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -49,10 +53,10 @@ class SubitoScraper:
         
     def fetch_ads(self, url):
         """
-        Fetches the target URL with exponential backoff retries on 403/429 errors.
+        Fetches the target URL with session reset on 403 errors and randomized exponential backoff.
         """
         retries = 3
-        wait_time = 5  # Initial wait in seconds
+        base_wait_time = 5  # Initial wait base in seconds
         
         for attempt in range(retries):
             try:
@@ -62,11 +66,24 @@ class SubitoScraper:
                 if res.status_code == 200:
                     return self._parse_response(res.text)
                 
-                # Blocked: Retry with exponential backoff
-                if res.status_code in [403, 429]:
-                    self._debug_print(f"Attempt {attempt + 1} failed (HTTP {res.status_code}). Retrying in {wait_time}s...")
-                    time.sleep(wait_time)
-                    wait_time *= 2
+                # Blocked: Wait ~10s, reset session, wait ~3s
+                if res.status_code == 403:
+                    wait_reset = random.uniform(8.0, 12.0)
+                    wait_after = random.uniform(2.0, 4.0)
+                    
+                    self._debug_print(f"Attempt {attempt + 1} failed (HTTP 403). Waiting {wait_reset:.2f}s to reset session...")
+                    time.sleep(wait_reset)
+                    self._reset_session()
+                    self._debug_print(f"Session reset. Waiting {wait_after:.2f}s before retrying...")
+                    time.sleep(wait_after)
+                    continue
+
+                # Rate limited: Retry with randomized exponential backoff
+                if res.status_code == 429:
+                    jittered_wait = base_wait_time * random.uniform(0.8, 1.2)
+                    self._debug_print(f"Attempt {attempt + 1} failed (HTTP 429). Retrying in {jittered_wait:.2f}s...")
+                    time.sleep(jittered_wait)
+                    base_wait_time *= 2
                     continue
                 
                 self._debug_print(f"HTTP {res.status_code} for URL: {url}")
@@ -75,8 +92,9 @@ class SubitoScraper:
             except Exception as e:
                 self._debug_print(f"fetch_ads exception: {e}")
                 if attempt < retries - 1:
-                    time.sleep(wait_time)
-                    wait_time *= 2
+                    jittered_wait = base_wait_time * random.uniform(0.8, 1.2)
+                    time.sleep(jittered_wait)
+                    base_wait_time *= 2
                     continue
                 return []
         return []

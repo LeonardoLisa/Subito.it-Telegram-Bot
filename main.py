@@ -168,9 +168,8 @@ def main():
                         db.add_tracked_item(ad['link'], ad['title'], ad['price'], category, keyword)
                 
                 # Implement random jitter between 2 and 6 seconds to mimic human behavior
-                jitter = random.uniform(1.0, 3.5)
+                jitter = random.uniform(0.5, 1.5)
                 debug_log(f"Applying jitter: {jitter:.2f}s")
-                #time.sleep(1)
                 time.sleep(jitter)
 
         db.trim_tracked_items(max_items=30)
