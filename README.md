@@ -76,13 +76,13 @@ The program runs continuously in daemon mode by default. Its behavior is governe
 **Startup Examples:**
 ```bash
 # Standard startup with a check every 2 minutes
-uv run main.py
+python3 main.py
 
 # Startup with a check every 60 seconds
-uv run main.py -r 60
+python3 main.py -r 60
 
 # Startup with a 30-second delay, debug output enabled, skipping old ads
-uv run main.py --refreshrate 30 --debug --skip
+python3 main.py --refreshrate 30 --debug --skip
 ```
 
 ## 📱 Telegram Commands
@@ -92,7 +92,8 @@ User interaction occurs via direct chat with the bot.
 * `/sub` or `/start`: Subscribes the user and starts receiving notifications.
 * `/unsub`: Unsubscribes the user and removes the Chat ID from the database.
 * `/search`: Prints the hierarchical list of active searches currently in the database.
-* `/add <link>`: Starts an interactive flow to add a new search. You will be guided to select/create a category and set a keyword. **Note:** The link must be a valid Subito.it URL strictly pointing to the `/annunci-italia/vendita/` path.
+* `/add <link>`: Starts an interactive flow to add a new search. You will be guided to select/create a category and set a keyword.+
+  **Note:** The link must be a valid Subito.it URL strictly pointing to the `/annunci-italia/vendita/` path.
 * `/rm <keyword>`: Removes an existing search via an interactive confirmation menu. Empty categories are automatically cleaned up.
 * `/status`: Displays the number of active users and the system uptime formatted in years, months, days, hours, and minutes.
 * `🛑 /cancel`: Instantly aborts the current action (e.g., waiting for keyword input) and resets the user's state.
