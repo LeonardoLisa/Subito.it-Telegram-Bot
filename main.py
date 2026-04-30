@@ -173,7 +173,7 @@ def main():
                 debug_log(f"Applying jitter: {jitter:.2f}s")
                 time.sleep(jitter)
 
-        db.trim_tracked_items(max_items=30)
+        db.trim_tracked_items(max_items=150)
         db.save_all()
         skip_next = False
 
