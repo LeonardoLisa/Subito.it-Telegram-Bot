@@ -20,22 +20,17 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 # Security & Credentials
-.env
+*.env
 
-# Application State & Databases
-tracked_items.json
-messages_to_delete.json
-subscribers.json
-known_urls.json
-searches.tracked
+# SQLite database files
+*.db
+*.sqlite
+*.sqlite3
 
-# User Configuration (Optional: remove if you want to share your searches)
-searches.json
-
-# Legacy Original Script Files
-telegram_api_credentials
-telegram-send.conf
-ntfy_config
+# SQLite temporary journal files
+*.db-journal
+*.db-shm
+*.db-wal
 
 # Python Standard Ignores
 __pycache__/
@@ -63,4 +58,9 @@ wheels/
 venv/
 .venv/
 env/
+.env/
 ENV/
+.ENV/
+
+# Editor (VS Code)
+.vscode/

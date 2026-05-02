@@ -1,23 +1,18 @@
 """
 Filename: telegram_ui.py
-Version: 3.5.0
-Date: 2026-04-29
+Version: 4.0.0
+Date: 2026-04-30
 Author: Leonardo Lisa
-Description: Standardized Telegram Bot Controller. Implements automated cache pruning (30m), uptime formatting, and verbose error logging.
+Description: Standardized Telegram Bot Controller updated for SQLite integration.
+             Implements per-user targeted broadcasting, automatic database pruning,
+             and UI flows for managing per-user searches with exclusion keywords.
 Requirements: requests, curl_cffi
 
+GNU GPLv3 Prelude:
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
 the Free Software Foundation, either version 3 of the License, or
 (at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 from curl_cffi import requests as cffi_requests
@@ -32,12 +27,12 @@ from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 class TelegramUI:
     TIMEOUT_SECONDS = 4 * 24 * 3600  # 96 hours
     CACHE_PRUNE_INTERVAL = 1800      # 30 minutes
+    MAX_REGULAR_SEARCHES = 15        # Maximum allowed searches for regular users
 
-    def __init__(self, token, db, shutdown_event, max_subs=1):
+    def __init__(self, token, db, shutdown_event):
         self.token = token
         self.db = db
         self.shutdown_event = shutdown_event
-        self.max_subs = max_subs
         self.debug_mode = False
         self.user_states = {}
         self.callback_cache = {}
@@ -99,15 +94,13 @@ class TelegramUI:
 
     def clear_offline_updates(self):
         url = f"https://api.telegram.org/bot{self.token}/getUpdates"
-        payload = {"offset": int(self.db.last_update_id) + 1, "timeout": 5}
+        payload = {"offset": self.db.last_update_id + 1, "timeout": 5}
         try:
             res = requests.post(url, json=payload, timeout=10)
             data = res.json()
             if data.get("ok") and data["result"]:
-                with self.db.lock:
-                    for update in data["result"]:
-                        self.db.last_update_id = update["update_id"]
-                self.db.save_all()
+                for update in data["result"]:
+                    self.db.save_update_id(update["update_id"])
         except Exception as e:
             self._debug_print(f"Clear queue error: {e}")
 
@@ -122,42 +115,58 @@ class TelegramUI:
         except Exception as e:
             self._debug_print(f"Direct Msg Net Error: {e}")
 
-    def broadcast(self, msg_text, image_bytes=None, item_url=None, show_delete=True):
-        with self.db.lock:
-            subs = list(self.db.subscribers.keys())
-        if not subs: return
-        
+    def send_ad(self, chat_id, msg_text, image_bytes=None, item_url=None):
+        """Sends an ad notification directly to a specific user (replaces global broadcast for ads)."""
         reply_markup = {"inline_keyboard": []}
         if item_url:
             reply_markup["inline_keyboard"].append([{"text": "🛒 Go to Ad", "url": item_url}])
+        reply_markup["inline_keyboard"].append([{"text": "🗑️ Delete", "callback_data": "delete_msg"}])
+        reply_markup_json = json.dumps(reply_markup)
+
+        try:
+            sent = False
+            if image_bytes:
+                url = f"https://api.telegram.org/bot{self.token}/sendPhoto"
+                payload = {"chat_id": chat_id, "caption": msg_text[:1024], "parse_mode": "HTML", "reply_markup": reply_markup_json}
+                files = {"photo": ("image.jpg", image_bytes, "image/jpeg")}
+                res = requests.post(url, data=payload, files=files, timeout=15)
+                data = res.json()
+                if data.get("ok"): 
+                    sent = True
+                else:
+                    self._debug_print(f"Photo Send API Error: {data}")
+
+            if not sent:
+                url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+                payload = {"chat_id": chat_id, "text": msg_text, "parse_mode": "HTML", "disable_web_page_preview": True, "reply_markup": reply_markup_json}
+                res = requests.post(url, json=payload, timeout=10)
+                data = res.json()
+                if not data.get("ok"):
+                    self._debug_print(f"Text Send API Error: {data}")
+        except Exception as e:
+            self._debug_print(f"Send Ad Net Error: {e}")
+
+    def broadcast(self, msg_text, show_delete=True):
+        """Sends a global system message to all registered users."""
+        users = self.db.get_all_users()
+        if not users: return
+        
+        reply_markup = {"inline_keyboard": []}
         if show_delete:
             reply_markup["inline_keyboard"].append([{"text": "🗑️ Delete", "callback_data": "delete_msg"}])
             
         reply_markup_json = json.dumps(reply_markup) if reply_markup["inline_keyboard"] else None
 
-        for chat_id in subs:
+        for user in users:
+            chat_id = user['chat_id']
             try:
-                sent = False
-                if image_bytes:
-                    url = f"https://api.telegram.org/bot{self.token}/sendPhoto"
-                    payload = {"chat_id": chat_id, "caption": msg_text[:1024], "parse_mode": "HTML"}
-                    if reply_markup_json: payload["reply_markup"] = reply_markup_json
-                    files = {"photo": ("image.jpg", image_bytes, "image/jpeg")}
-                    res = requests.post(url, data=payload, files=files, timeout=15)
-                    data = res.json()
-                    if data.get("ok"): 
-                        sent = True
-                    else:
-                        self._debug_print(f"Photo Broadcast API Error: {data}")
-
-                if not sent:
-                    url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-                    payload = {"chat_id": chat_id, "text": msg_text, "parse_mode": "HTML", "disable_web_page_preview": True}
-                    if reply_markup_json: payload["reply_markup"] = reply_markup_json
-                    res = requests.post(url, json=payload, timeout=10)
-                    data = res.json()
-                    if not data.get("ok"):
-                        self._debug_print(f"Text Broadcast API Error: {data}")
+                url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+                payload = {"chat_id": chat_id, "text": msg_text, "parse_mode": "HTML", "disable_web_page_preview": True}
+                if reply_markup_json: payload["reply_markup"] = reply_markup_json
+                res = requests.post(url, json=payload, timeout=10)
+                data = res.json()
+                if not data.get("ok"):
+                    self._debug_print(f"Text Broadcast API Error: {data}")
             except Exception as e:
                 self._debug_print(f"Broadcast Net Error: {e}")
 
@@ -169,19 +178,14 @@ class TelegramUI:
             if time.time() - self.last_cache_prune > self.CACHE_PRUNE_INTERVAL:
                 self._prune_internal_memory()
 
-            payload = {"offset": int(self.db.last_update_id) + 1, "timeout": 60}
+            payload = {"offset": self.db.last_update_id + 1, "timeout": 60}
             try:
                 res = requests.post(url, json=payload, timeout=65)
                 data = res.json()
                 if data.get("ok") and data["result"]:
-                    state_changed = False
                     for update in data["result"]:
-                        with self.db.lock:
-                            self.db.last_update_id = update["update_id"]
+                        self.db.save_update_id(update["update_id"])
                         self._process_update(update)
-                        state_changed = True
-                    if state_changed:
-                        self.db.save_all()
                 elif not data.get("ok"):
                     self._debug_print(f"Poll API Error: {data}")
             except requests.exceptions.Timeout:
@@ -193,8 +197,12 @@ class TelegramUI:
 
     def _process_update(self, update):
         if "message" in update and "text" in update["message"]:
-            chat_id = str(update["message"]["chat"]["id"])
+            chat_id = update["message"]["chat"]["id"]
             text = update["message"]["text"].strip()
+            
+            # Ensure user exists in DB before processing
+            user_data = self.db.get_user(chat_id)
+            is_superuser = user_data['is_superuser'] == 1 if user_data else False
             
             if text == "/cancel":
                 with self.db.lock: self.user_states.pop(chat_id, None)
@@ -206,29 +214,30 @@ class TelegramUI:
                     del self.user_states[chat_id]
             
             if text in ["/start", "/sub"]:
-                with self.db.lock:
-                    days = self.TIMEOUT_SECONDS // 86400
-                    if chat_id not in self.db.subscribers:
-                        if len(self.db.subscribers) >= self.max_subs:
-                            self.send_direct_message(chat_id, f"⚠️ System full. Max {self.max_subs} users.")
-                        else:
-                            self.db.subscribers[chat_id] = {"joined": time.time(), "notified": False}
-                            self.send_direct_message(chat_id, f"✅ Subscription active for {days} days.")
-                    else:
-                        self.db.subscribers[chat_id]["joined"] = time.time()
-                        self.db.subscribers[chat_id]["notified"] = False
-                        self.send_direct_message(chat_id, f"✅ Subscription renewed for {days} days.")
+                days = self.TIMEOUT_SECONDS // 86400
+                if not user_data:
+                    self.db.register_user(chat_id)
+                    self.send_direct_message(chat_id, f"✅ Subscription active for {days} days.")
+                else:
+                    self.db.register_user(chat_id) # Updates last_active
+                    self.send_direct_message(chat_id, f"✅ Subscription renewed for {days} days.")
+                return # Stop processing if user wasn't registered
                 
             elif text == "/unsub":
-                with self.db.lock:
-                    if chat_id in self.db.subscribers: 
-                        del self.db.subscribers[chat_id]
-                        self.send_direct_message(chat_id, "❌ Unsubscribed.")
-                    else:
-                        self.send_direct_message(chat_id, "⚠️ Not subscribed.")
+                if user_data: 
+                    self.db.remove_user(chat_id)
+                    self.send_direct_message(chat_id, "❌ Unsubscribed. All your data has been deleted.")
+                else:
+                    self.send_direct_message(chat_id, "⚠️ Not subscribed.")
+                return
+
+            # Commands below require subscription
+            if not user_data:
+                self.send_direct_message(chat_id, "⚠️ <b>Action Denied.</b>\nYou must subscribe first using /sub.")
+                return
                 
-            elif text in ["/search", "/searches"]:
-                with self.db.lock: searches = self.db.searches.copy()
+            if text in ["/search", "/searches"]:
+                searches = self.db.get_user_searches(chat_id)
                 if not searches:
                     self.send_direct_message(chat_id, "📂 <b>Active Searches:</b>\n\nNo active searches.")
                 else:
@@ -239,6 +248,11 @@ class TelegramUI:
                     self.send_direct_message(chat_id, "📂 <b>Select a category:</b>", reply_markup=keyboard)
 
             elif text.startswith("/add"):
+                current_count = self.db.count_user_searches(chat_id)
+                if not is_superuser and current_count >= self.MAX_REGULAR_SEARCHES:
+                    self.send_direct_message(chat_id, f"⚠️ <b>Limit Reached.</b>\nYou cannot have more than {self.MAX_REGULAR_SEARCHES} active searches.")
+                    return
+
                 parts = text.split(" ", 1)
                 if len(parts) < 2:
                     self.send_direct_message(chat_id, "⚠️ <b>Usage:</b> /add &lt;link&gt;")
@@ -286,7 +300,7 @@ class TelegramUI:
                     self.send_direct_message(chat_id, "⚠️ <b>Network Error:</b> Validation failed. Try again.")
                     return
                     
-                with self.db.lock: searches = self.db.searches.copy()
+                searches = self.db.get_user_searches(chat_id)
                 keyboard = {"inline_keyboard": []}
                 for cat in searches.keys():
                     cb_data = self._create_callback_data({"action": "addcat", "cat": cat})
@@ -305,46 +319,55 @@ class TelegramUI:
             elif text.startswith("/rm"):
                 parts = text.split(" ", 1)
                 if len(parts) < 2:
-                    self.send_direct_message(chat_id, "⚠️ <b>Usage:</b> /rm &lt;keyword&gt;")
+                    self.send_direct_message(chat_id, "⚠️ <b>Usage:</b> /rm &lt;Search Name&gt;")
                     return
-                kw = parts[1].strip()
-                with self.db.lock: searches = self.db.searches.copy()
+                search_name = parts[1].strip()
+                searches = self.db.get_user_searches(chat_id)
                 
                 matches = []
-                for cat, kws in searches.items():
-                    if kw in kws:
-                        matches.append((cat, kw))
+                for cat, items in searches.items():
+                    for item in items:
+                        if item['name'] == search_name:
+                            matches.append((cat, item['name']))
                         
                 if not matches:
-                    self.send_direct_message(chat_id, "⚠️ <b>Error:</b> Keyword not found.")
+                    self.send_direct_message(chat_id, "⚠️ <b>Error:</b> Search Name not found.")
                 else:
                     keyboard = {"inline_keyboard": []}
-                    for cat, match_kw in matches:
-                        cb_conf = self._create_callback_data({"action": "rmconf", "cat": cat, "kw": match_kw})
-                        keyboard["inline_keyboard"].append([{"text": f"🗑️ {cat} - {match_kw}", "callback_data": cb_conf}])
+                    for cat, match_name in matches:
+                        cb_conf = self._create_callback_data({"action": "rmconf", "name": match_name})
+                        keyboard["inline_keyboard"].append([{"text": f"🗑️ {cat} - {match_name}", "callback_data": cb_conf}])
                     
                     cb_cancel = self._create_callback_data({"action": "cancel"})
                     keyboard["inline_keyboard"].append([{"text": "❌ Cancel", "callback_data": cb_cancel}])
                     
-                    self.send_direct_message(chat_id, f"🗑️ <b>Select search to delete:</b>\nKeyword: {html.escape(kw)}", reply_markup=keyboard)
+                    self.send_direct_message(chat_id, f"🗑️ <b>Select search to delete:</b>\nSearch Name: {html.escape(search_name)}", reply_markup=keyboard)
 
             elif text == "/help":
                 help_text = (
                     "🤖 <b>Available Commands</b>\n\n"
                     "✅ <b>/sub</b> - Subscribe to receive alerts.\n"
-                    "❌ <b>/unsub</b> - Unsubscribe.\n"
+                    "❌ <b>/unsub</b> - Unsubscribe and delete your data.\n"
                     "🔎 <b>/search</b> - View active searches.\n"
                     "➕ <b>/add &lt;link&gt;</b> - Add a new search.\n"
-                    "🗑️ <b>/rm &lt;keyword&gt;</b> - Remove a search.\n"
+                    "🗑️ <b>/rm &lt;Search Name&gt;</b> - Remove a search.\n"
                     "📊 <b>/status</b> - View system status.\n"
                     "🛑 <b>/cancel</b> - Abort current action."
                 )
                 self.send_direct_message(chat_id, help_text)
 
             elif text == "/status":
-                with self.db.lock: active_count = len(self.db.subscribers)
+                active_count = len(self.db.get_all_users())
+                user_search_count = self.db.count_user_searches(chat_id)
                 uptime_str = self._get_uptime_string()
-                self.send_direct_message(chat_id, f"📊 <b>System Status</b>\nUsers: {active_count}/{self.max_subs}\nUptime: {uptime_str}")
+                
+                status_msg = f"📊 <b>System Status</b>\nUptime: {uptime_str}\nTotal Users: {active_count}\n\n"
+                status_msg += f"👤 <b>Your Account</b>\nActive Searches: {user_search_count}"
+                
+                if not is_superuser:
+                    status_msg += f"/{self.MAX_REGULAR_SEARCHES}"
+                    
+                self.send_direct_message(chat_id, status_msg)
 
             elif chat_id in self.user_states:
                 with self.db.lock:
@@ -361,30 +384,58 @@ class TelegramUI:
                         with self.db.lock:
                             self.user_states[chat_id]["state"] = "waiting_keyword"
                             self.user_states[chat_id]["category"] = new_cat
-                        self.send_direct_message(chat_id, f"Category '<b>{html.escape(new_cat)}</b>' set. Write keyword:")
+                        self.send_direct_message(chat_id, f"Category '<b>{html.escape(new_cat)}</b>' set. Write the Search Name:")
                         
                 elif state_data["state"] == "waiting_keyword":
                     new_kw = text.strip()
                     cat = state_data["category"]
+                    
+                    # Check for duplicates for this user
+                    searches = self.db.get_user_searches(chat_id)
+                    existing_names = [item['name'] for items in searches.values() for item in items]
+                    
+                    base_kw = new_kw
+                    counter = 1
+                    while new_kw in existing_names:
+                        new_kw = f"{base_kw} {counter}"
+                        counter += 1
+
+                    with self.db.lock:
+                        self.user_states[chat_id]["state"] = "waiting_exclusion"
+                        self.user_states[chat_id]["name"] = new_kw
+                        
+                    self.send_direct_message(
+                        chat_id, 
+                        f"Search Name set to '<b>{html.escape(new_kw)}</b>'.\n\n"
+                        f"Optional: Send up to 3 <b>exclusion keywords</b> separated by commas (e.g. broken, parts, not working).\n"
+                        f"Send <b>NONE</b> to skip this step."
+                    )
+                        
+                elif state_data["state"] == "waiting_exclusion":
+                    excl_input = text.strip().lower()
+                    cat = state_data["category"]
                     link = state_data["link"]
+                    name = state_data["name"]
+                    
+                    exclusion_list = []
+                    if excl_input != "none":
+                        raw_list = [k.strip() for k in excl_input.split(',')]
+                        exclusion_list = [k for k in raw_list if k][:3] # Take up to 3 valid keywords
+                    
+                    self.db.add_search(chat_id, cat, name, link, exclusion_list)
                     
                     with self.db.lock:
-                        if cat not in self.db.searches: self.db.searches[cat] = {}
-                        
-                        base_kw = new_kw
-                        counter = 1
-                        while new_kw in self.db.searches[cat]:
-                            new_kw = f"{base_kw} {counter}"
-                            counter += 1
-                            
-                        self.db.searches[cat][new_kw] = link
                         del self.user_states[chat_id]
                         
-                    self.send_direct_message(chat_id, f"✅ <b>Added!</b>\n📂 Category: {html.escape(cat)}\n🔑 Keyword: {html.escape(new_kw)}")
+                    excl_str = ", ".join(exclusion_list) if exclusion_list else "None"
+                    self.send_direct_message(
+                        chat_id, 
+                        f"✅ <b>Added!</b>\n📂 Category: {html.escape(cat)}\n🔑 Search Name: {html.escape(name)}\n🚫 Exclusions: {html.escape(excl_str)}"
+                    )
 
         elif "callback_query" in update:
             cb = update["callback_query"]
-            chat_id = str(cb["message"]["chat"]["id"])
+            chat_id = cb["message"]["chat"]["id"]
             message_id = cb["message"]["message_id"]
             cb_id = cb["id"]
             cb_data = cb.get("data", "")
@@ -400,7 +451,7 @@ class TelegramUI:
                     self._debug_print(f"Delete msg error: {e}")
                 
             elif cb_data == "search_back":
-                with self.db.lock: searches = self.db.searches.copy()
+                searches = self.db.get_user_searches(chat_id)
                 keyboard = {"inline_keyboard": []}
                 for cat in searches.keys():
                     c_data = self._create_callback_data({"action": "cat", "cat": cat})
@@ -433,11 +484,11 @@ class TelegramUI:
 
                 elif action == "cat":
                     cat_name = cb_info["cat"]
-                    with self.db.lock: searches = self.db.searches.copy()
+                    searches = self.db.get_user_searches(chat_id)
                     if cat_name in searches:
                         keyboard = {"inline_keyboard": []}
-                        for kw, url_link in searches[cat_name].items():
-                            keyboard["inline_keyboard"].append([{"text": kw, "url": url_link}])
+                        for item in searches[cat_name]:
+                            keyboard["inline_keyboard"].append([{"text": item['name'], "url": item['url']}])
                         keyboard["inline_keyboard"].append([{"text": "🔙 Back", "callback_data": "search_back"}])
                         try: 
                             requests.post(edit_url, json={"chat_id": chat_id, "message_id": message_id, "text": f"📂 <b>{html.escape(cat_name)}</b>\nSelect a search:", "parse_mode": "HTML", "reply_markup": keyboard}, timeout=5)
@@ -463,20 +514,15 @@ class TelegramUI:
                                 self.user_states[chat_id]["category"] = cat_name
                                 self.user_states[chat_id]["timestamp"] = time.time()
                             try: 
-                                requests.post(edit_url, json={"chat_id": chat_id, "message_id": message_id, "text": f"Category '<b>{html.escape(cat_name)}</b>' selected. Write keyword:", "parse_mode": "HTML"}, timeout=5)
+                                requests.post(edit_url, json={"chat_id": chat_id, "message_id": message_id, "text": f"Category '<b>{html.escape(cat_name)}</b>' selected. Write the Search Name:", "parse_mode": "HTML"}, timeout=5)
                             except Exception as e:
                                 self._debug_print(f"Add cat cb error: {e}")
                             
                 elif action == "rmconf":
-                    cat = cb_info["cat"]
-                    kw = cb_info["kw"]
-                    with self.db.lock:
-                        if cat in self.db.searches and kw in self.db.searches[cat]:
-                            del self.db.searches[cat][kw]
-                            if not self.db.searches[cat]: 
-                                del self.db.searches[cat]
+                    name = cb_info["name"]
+                    self.db.remove_search(chat_id, name)
                     try: 
-                        requests.post(edit_url, json={"chat_id": chat_id, "message_id": message_id, "text": f"✅ Search <b>{html.escape(kw)}</b> deleted.", "parse_mode": "HTML"}, timeout=5)
+                        requests.post(edit_url, json={"chat_id": chat_id, "message_id": message_id, "text": f"✅ Search <b>{html.escape(name)}</b> deleted.", "parse_mode": "HTML"}, timeout=5)
                     except Exception as e:
                         self._debug_print(f"Rmconf cb error: {e}")
 
