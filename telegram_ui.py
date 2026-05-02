@@ -1,6 +1,6 @@
 """
 Filename: telegram_ui.py
-Version: 4.0.1
+Version: 4.2.0
 Date: 2026-04-30
 Author: Leonardo Lisa
 Description: Standardized Telegram Bot Controller updated for SQLite integration.
@@ -252,6 +252,7 @@ class TelegramUI:
                     for cat in searches.keys():
                         cb_data = self._create_callback_data({"action": "cat", "cat": cat})
                         keyboard["inline_keyboard"].append([{"text": f"📁 {cat}", "callback_data": cb_data}])
+                    keyboard["inline_keyboard"].append([{"text": "❌ Close", "callback_data": "delete_msg"}])
                     self.send_direct_message(chat_id, "📂 <b>Select a category:</b>", reply_markup=keyboard)
 
             elif text.startswith("/add"):
@@ -463,6 +464,7 @@ class TelegramUI:
                 for cat in searches.keys():
                     c_data = self._create_callback_data({"action": "cat", "cat": cat})
                     keyboard["inline_keyboard"].append([{"text": f"📁 {cat}", "callback_data": c_data}])
+                keyboard["inline_keyboard"].append([{"text": "❌ Close", "callback_data": "delete_msg"}])
                 try: 
                     requests.post(edit_url, json={"chat_id": chat_id, "message_id": message_id, "text": "📂 <b>Select a category:</b>", "parse_mode": "HTML", "reply_markup": keyboard}, timeout=5)
                 except Exception as e:
@@ -495,12 +497,58 @@ class TelegramUI:
                     if cat_name in searches:
                         keyboard = {"inline_keyboard": []}
                         for item in searches[cat_name]:
-                            keyboard["inline_keyboard"].append([{"text": item['name'], "url": item['url']}])
+                            c_data = self._create_callback_data({"action": "search_menu", "cat": cat_name, "name": item['name']})
+                            keyboard["inline_keyboard"].append([{"text": item['name'], "callback_data": c_data}])
                         keyboard["inline_keyboard"].append([{"text": "🔙 Back", "callback_data": "search_back"}])
                         try: 
                             requests.post(edit_url, json={"chat_id": chat_id, "message_id": message_id, "text": f"📂 <b>{html.escape(cat_name)}</b>\nSelect a search:", "parse_mode": "HTML", "reply_markup": keyboard}, timeout=5)
                         except Exception as e:
                             self._debug_print(f"Cat cb error: {e}")
+                
+                elif action == "search_menu":
+                    cat_name = cb_info["cat"]
+                    search_name = cb_info["name"]
+                    searches = self.db.get_user_searches(chat_id)
+                    
+                    target_item = None
+                    if cat_name in searches:
+                        for item in searches[cat_name]:
+                            if item['name'] == search_name:
+                                target_item = item
+                                break
+                                
+                    if target_item:
+                        url = target_item['url']
+                        
+                        msg_text = (
+                            f"📂 <b>Category:</b> {html.escape(cat_name)}\n"
+                            f"🔍 <b>Search:</b> {html.escape(search_name)}\n"
+                        )
+                        
+                        if target_item['exclusion_kws']:
+                            excl = ", ".join(target_item['exclusion_kws'])
+                            msg_text += f"🚫 <b>Exclusions:</b> {html.escape(excl)}\n"
+                            
+                        # Mantenuto per il tap-to-copy sui client vecchi
+                        msg_text += f"\n🔗 <b>Direct Link:</b>\n<code>{html.escape(url)}</code>"
+                        
+                        keyboard = {"inline_keyboard": []}
+                        cb_rm = self._create_callback_data({"action": "rmconf", "name": search_name})
+                        cb_back = self._create_callback_data({"action": "cat", "cat": cat_name})
+                        
+                        # Aggiunta dei bottoni in verticale
+                        keyboard["inline_keyboard"].append([{"text": "🗑️ Delete", "callback_data": cb_rm}])
+                        keyboard["inline_keyboard"].append([{"text": "🔗 Copy Link", "copy_text": {"text": url}}])
+                        keyboard["inline_keyboard"].append([{"text": "🌐 Open Link", "url": url}])
+                        keyboard["inline_keyboard"].append([{"text": "🔙 Back", "callback_data": cb_back}])
+                        
+                        try:
+                            requests.post(edit_url, json={"chat_id": chat_id, "message_id": message_id, "text": msg_text, "parse_mode": "HTML", "reply_markup": keyboard}, timeout=5)
+                        except Exception as e:
+                            self._debug_print(f"Search menu cb error: {e}")
+                    else:
+                        try: requests.post(edit_url, json={"chat_id": chat_id, "message_id": message_id, "text": "⚠️ Search not found.", "parse_mode": "HTML"}, timeout=5)
+                        except: pass
                         
                 elif action == "addcat":
                     cat_name = cb_info["cat"]
