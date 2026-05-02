@@ -1,6 +1,6 @@
 """
 Filename: telegram_ui.py
-Version: 4.0.0
+Version: 4.0.1
 Date: 2026-04-30
 Author: Leonardo Lisa
 Description: Standardized Telegram Bot Controller updated for SQLite integration.
@@ -28,6 +28,7 @@ class TelegramUI:
     TIMEOUT_SECONDS = 4 * 24 * 3600  # 96 hours
     CACHE_PRUNE_INTERVAL = 1800      # 30 minutes
     MAX_REGULAR_SEARCHES = 15        # Maximum allowed searches for regular users
+    MAX_SUBSCRIBERS = 3              # Maximum number of total allowed users
 
     def __init__(self, token, db, shutdown_event):
         self.token = token
@@ -214,14 +215,20 @@ class TelegramUI:
                     del self.user_states[chat_id]
             
             if text in ["/start", "/sub"]:
-                days = self.TIMEOUT_SECONDS // 86400
+                days = self.TIMEOUT_SECONDS
                 if not user_data:
+                    # Check capacity before registering a NEW user
+                    current_users = len(self.db.get_all_users())
+                    if current_users >= self.MAX_SUBSCRIBERS:
+                        self.send_direct_message(chat_id, "⚠️ <b>Registrations Closed.</b>\nThe bot has reached its maximum user capacity.")
+                        return
+                    
                     self.db.register_user(chat_id)
                     self.send_direct_message(chat_id, f"✅ Subscription active for {days} days.")
                 else:
                     self.db.register_user(chat_id) # Updates last_active
                     self.send_direct_message(chat_id, f"✅ Subscription renewed for {days} days.")
-                return # Stop processing if user wasn't registered
+                return
                 
             elif text == "/unsub":
                 if user_data: 

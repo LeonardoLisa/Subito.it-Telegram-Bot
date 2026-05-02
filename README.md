@@ -30,12 +30,13 @@ Monitora automaticamente le tue ricerche su Subito.it e ricevi aggiornamenti via
 
 ## ⚙️ Core Features
 
-* **Interactive Telegram UI:** Fully manage your searches, categories, and keywords directly from the chat using inline keyboards and guided setup flows.
+* **Interactive Telegram UI:** Fully manage your searches, categories, and **exclusion keywords** directly from the chat using inline keyboards and guided setup flows.
+* **Per-User Architecture:** Searches and notifications are strictly personal. The bot manages independent tracking queues for each user, allowing personalized configurations and targeted messaging instead of global broadcasting.
+* **Relational Database (SQLite):** State is persistently and efficiently managed via a robust, thread-safe SQLite database (`subito_bot.db`) with cascading deletes, ensuring data integrity and zero RAM overhead.
 * **Asynchronous Polling:** Separated scraping and Telegram API threads for zero-latency command processing.
 * **WAF Resilience & Backoff:** Uses a dedicated Chromium-spoofed `requests.Session` exclusively for querying Subito.it. In case of temporary IP bans (HTTP 403), the session is reset with randomized delays. For rate limiting (HTTP 429), the system performs up to 3 retries, doubling the wait time at each failure.
 * **Long Polling Telegram:** Reduces network traffic by keeping HTTP connections open for 60 seconds to Telegram servers.
 * **Instant Graceful Teardown:** The main loop utilizes a 1-second interruptible sleep cycle. Upon receiving a `SIGINT` (Ctrl+C) or `SIGTERM`, the daemon immediately halts the sleep cycle, safely saves the state, and broadcasts an offline message without waiting for the refresh delay to naturally expire.
-* **Atomic Writes:** JSON file I/O is managed via `os.replace` on temporary files, ensuring immunity to data corruption during crashes or power losses.
 * **Native Photo Broadcasting:** Dynamically resolves Subito's `cdnBaseUrl` via query string API rules (`?rule=gallery-desktop-1x-auto`) to download the highest quality JPEG directly into RAM and broadcast it using Telegram's native `sendPhoto` `multipart/form-data` endpoint.
 * **Hybrid Error Handling:** Verifies network connectivity via TCP DNS sockets (1.1.1.1:53) before querying the target, halting execution during outages without generating exception loops.
 
@@ -51,19 +52,11 @@ Monitora automaticamente le tue ricerche su Subito.it e ricevi aggiornamenti via
    TELEGRAM_BOT_TOKEN=123456789:ABCDEF_ghijklmnopqrstuvwxyz
    ```
 
-## 📁 Search Configuration (`searches.json`)
+## 📁 Database Configuration (SQLite)
 
-**The bot automatically generates and manages the `searches.json` file through the interactive Telegram commands (`/add` and `/rm`). You do not need to create or edit this file manually.**
+**The bot automatically generates and manages the `subito_bot.db` SQLite database through interactive Telegram commands (`/add` and `/rm`). You do not need to create or edit configuration files manually.**
 
-However, if you prefer manual configuration, the structure must strictly follow the JSON format with two levels of nesting: `{"Search_Name": {"Keyword": "Full_URL"}}`.
-
-```json
-{
-  "Electronics": {
-    "Macbook Air M1": "[https://www.subito.it/annunci-italia/vendita/usato/?q=macbook+air+m1](https://www.subito.it/annunci-italia/vendita/usato/?q=macbook+air+m1)"
-  }
-}
-```
+All user subscriptions, active searches, exclusion keywords, and tracked ads histories are securely stored in relational tables with cascading deletion policies.
 
 ## 🚀 CLI Usage
 
@@ -90,12 +83,12 @@ python3 main.py --refreshrate 30 --debug --skip
 User interaction occurs via direct chat with the bot.
 
 * `/sub` or `/start`: Subscribes the user and starts receiving notifications.
-* `/unsub`: Unsubscribes the user and removes the Chat ID from the database.
+* `/unsub`: Unsubscribes the user and removes the Chat ID and all related data from the database.
 * `/search`: Prints the hierarchical list of active searches currently in the database.
-* `/add <link>`: Starts an interactive flow to add a new search. You will be guided to select/create a category and set a keyword.+
+* `/add <link>`: Starts an interactive flow to add a new search. You will be guided to select/create a category, set a search name, and optionally define up to 3 **exclusion keywords** to filter out unwanted ads.
   **Note:** The link must be a valid Subito.it URL strictly pointing to the `/annunci-italia/vendita/` path.
-* `/rm <keyword>`: Removes an existing search via an interactive confirmation menu. Empty categories are automatically cleaned up.
-* `/status`: Displays the number of active users and the system uptime formatted in years, months, days, hours, and minutes.
+* `/rm <Search Name>`: Removes an existing search via an interactive confirmation menu. Associated ads history is automatically cleaned up.
+* `/status`: Displays the number of active users, your active searches limit, and the system uptime formatted in years, months, days, hours, and minutes.
 * `🛑 /cancel`: Instantly aborts the current action (e.g., waiting for keyword input) and resets the user's state.
 * `/help`: Displays the command guide.
 
@@ -103,14 +96,12 @@ User interaction occurs via direct chat with the bot.
 
 The program implements automatic maintenance logic with static parameters defined in the source code.
 
-* **`MAX_SUBSCRIBERS` (15):** To prevent Telegram API rate-limiting during broadcasts, the system accepts a maximum of 15 simultaneous users.
-   See `telegram_ui.py`, line 36.
-* **`TIMEOUT_SECONDS` (96 Hours):** Subscriptions have a Time-To-Live of 4 days (`4 * 24 * 3600`). Once this threshold is reached, the user is automatically unsubscribed if they do not renew by sending `/sub` again. This prevents spamming inactive accounts.
-  See `telegram_ui.py`, line 33.
-* **Memory Pruning (30 Minutes):** To prevent memory leaks, abandoned inline-keyboard callbacks and incomplete user interaction states are automatically purged from RAM every 30 minutes.
-  See `telegram_ui.py`, line 34.
-* **Database Trimming:** To prevent storage bloat, the Garbage Collector (`trim_tracked_items()`) automatically limits the saved history to the last 30 items per active search category/keyword. Orphaned links from deleted categories are automatically pruned during the regular database trim cycle. Empty categories are immediately deleted from the JSON state upon keyword removal.
-  See `database.py`, line 91.
+* **`MAX_SUBSCRIBERS` (default is 3):** To prevent resource exhaustion and scraping overload, the system accepts a maximum of 5 registered users. New subscriptions are blocked once this limit is reached. See telegram_ui.py, line 31
+* **`MAX_REGULAR_SEARCHES` (default is 15):** To prevent Telegram API rate-limiting and server overload, a single user can have a maximum of 15 simultaneous active searches. See telegram_ui.py, line 30
+* **`TIMEOUT_SECONDS` (default is 96h):** Subscriptions have an active Time-To-Live of 4 days (`4 * 24 * 3600`). Once this threshold is reached, the bot suspends scanning for that user until they renew by sending `/sub` again. This prevents spamming inactive accounts. See telegram_ui.py, line 28
+* **`CACHE_PRUNE_INTERVAL` (default is 30m):** To prevent memory leaks, abandoned inline-keyboard callbacks and incomplete user interaction states are automatically purged from RAM every 30 minutes. See telegram_ui.py, line 29
+* **Deep Clean Retention (34 Days):** Users who remain inactive (without renewing their subscription) for 34 days are permanently purged from the database, along with all their searches and tracking history.
+* **Database Trimming:** To prevent storage bloat, the Garbage Collector (`trim_tracked_items()`) utilizes SQL subqueries to automatically limit the saved history to the newest 150 items per search ID. 
 
 ## License
 This project is licensed under the **GNU General Public License v3 (GPLv3)**. 
