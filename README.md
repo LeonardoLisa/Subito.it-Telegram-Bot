@@ -43,9 +43,9 @@ Monitora automaticamente le tue ricerche su Subito.it e ricevi aggiornamenti via
 ## 🛠 Installation
 
 1. Clone the repository and navigate to the directory.
-2. Install the required dependencies (using `uv` is strictly recommended for environment isolation):
+2. Install the required, version-pinned dependencies from `requirements.txt` (using `uv` is strictly recommended for environment isolation):
    ```bash
-   uv pip install curl_cffi beautifulsoup4 pillow python-dotenv
+   uv pip install -r requirements.txt
    ```
 3. Create a `.env` file in the project root and insert the token provided by BotFather:
    ```env
@@ -65,6 +65,7 @@ The program runs continuously in daemon mode by default. Its behavior is governe
 * `-r`, `--refreshrate [SECONDS]`: Sets the wait time between two complete scraping cycles. Default is `120`.
 * `-d`, `--debug`: Enables verbose logging for HTTP request tracking, CDN schema dumps, and Telegram API payloads.
 * `-s`, `--skip`: Skips sending notifications for pre-existing ads during the very first startup scan.
+* `-su`, `--superuser`: Opens an interactive, terminal-based (curses) menu listing every registered user, letting you promote/demote superusers with arrow-key navigation before the bot starts. Changes are only applied if you confirm; either way the bot then starts normally.
 
 **Startup Examples:**
 ```bash
@@ -76,6 +77,9 @@ python3 main.py -r 60
 
 # Startup with a 30-second delay, debug output enabled, skipping old ads
 python3 main.py --refreshrate 30 --debug --skip
+
+# Manage superusers interactively, then start normally
+python3 main.py --superuser
 ```
 
 ## 📱 Telegram Commands
@@ -84,24 +88,35 @@ User interaction occurs via direct chat with the bot.
 
 * `/sub` or `/start`: Subscribes the user and starts receiving notifications.
 * `/unsub`: Unsubscribes the user and removes the Chat ID and all related data from the database.
-* `/search`: Prints the hierarchical list of active searches currently in the database.
-* `/add <link>`: Starts an interactive flow to add a new search. You will be guided to select/create a category, set a search name, and optionally define up to 3 **exclusion keywords** to filter out unwanted ads.
+* `/search`: Prints the hierarchical list of active searches. Selecting a search opens a menu to **Pause/Resume** it, **Edit** it (URL, exclusion keywords, or include keywords, in place — the tracked-ads history is preserved), delete it, or open/copy its link.
+* `/add <link>`: Starts an interactive flow to add a new search: select/create a category, set a search name, optionally define up to `MAX_EXCLUSION_KEYWORDS` **exclusion keywords**, and optionally up to `MAX_INCLUDE_KEYWORDS` **include keywords** (if set, an ad is only notified when its title contains at least one of them).
   **Note:** The link must be a valid Subito.it URL strictly pointing to the `/annunci-italia/vendita/` path.
 * `/rm <Search Name>`: Removes an existing search via an interactive confirmation menu. Associated ads history is automatically cleaned up.
-* `/status`: Displays the number of active users, your active searches limit, and the system uptime formatted in years, months, days, hours, and minutes.
+* `/status`: Displays the number of active users, your active searches limit, the system uptime, and the remaining time before your subscription expires (or "Unlimited" for superusers).
+* `/broadcast <message>` (superusers only): Sends a message to every registered user.
 * `🛑 /cancel`: Instantly aborts the current action (e.g., waiting for keyword input) and resets the user's state.
 * `/help`: Displays the command guide.
 
-## ⏱ Internal Parameters (System Mechanics)
+## ⚙️ Configurazione avanzata via .env
 
-The program implements automatic maintenance logic with static parameters defined in the source code.
+All values below have sensible defaults and are entirely optional — set them in `.env` only if you need to change the bot's behavior.
 
-* **`MAX_SUBSCRIBERS` (default is 3):** To prevent resource exhaustion and scraping overload, the system accepts a maximum number of registered users. New subscriptions are blocked once this limit is reached. See telegram_ui.py, line 31
-* **`MAX_REGULAR_SEARCHES` (default is 15):** To prevent Telegram API rate-limiting and server overload, a single user can have a maximum of 15 simultaneous active searches. See telegram_ui.py, line 30
-* **`TIMEOUT_SECONDS` (default is 96h):** Subscriptions have an active Time-To-Live of 4 days (`4 * 24 * 3600`). Once this threshold is reached, the bot suspends scanning for that user until they renew by sending `/sub` again. This prevents spamming inactive accounts. See telegram_ui.py, line 28
-* **`CACHE_PRUNE_INTERVAL` (default is 30m):** To prevent memory leaks, abandoned inline-keyboard callbacks and incomplete user interaction states are automatically purged from RAM every 30 minutes. See telegram_ui.py, line 29
-* **Deep Clean Retention (34 Days):** Users who remain inactive (without renewing their subscription) for 34 days are permanently purged from the database, along with all their searches and tracking history.
-* **Database Trimming:** To prevent storage bloat, the Garbage Collector (`trim_tracked_items()`) utilizes SQL subqueries to automatically limit the saved history to the newest 150 items per search ID. 
+| Variable | Default | Description |
+|---|---|---|
+| `MAX_SUBSCRIBERS` | `3` | Maximum number of registered users. New `/sub` requests are rejected once reached. |
+| `MAX_REGULAR_SEARCHES` | `15` | Maximum simultaneous active searches per non-superuser. |
+| `SUBSCRIPTION_TTL_DAYS` | `4` | Soft subscription Time-To-Live, in days. Once exceeded, scanning is paused for that user (searches are **not** deleted) until they send `/sub` again. |
+| `CACHE_PRUNE_INTERVAL_SECONDS` | `1800` | How often abandoned inline-keyboard callbacks and incomplete interaction states are purged from RAM. |
+| `MAX_EXCLUSION_KEYWORDS` | `3` | Maximum exclusion keywords per search. |
+| `MAX_INCLUDE_KEYWORDS` | `3` | Maximum include keywords per search. |
+| `DEEP_CLEAN_RETENTION_DAYS` | `30` | Hard-delete retention, in days. Regular users inactive for longer than this are permanently purged, along with their searches and tracking history. **Always much longer than `SUBSCRIPTION_TTL_DAYS`, and superusers are always exempt.** |
+| `TRACKED_ADS_MAX_ITEMS` | `150` | Maximum tracked-ad history kept per search; older entries are trimmed every cycle. |
+| `DB_PATH` | `subito_bot.db` | Path to the SQLite database file. |
+
+### Scadenza dell'abbonamento: i due stadi
+La scadenza di un abbonamento regolare avviene in due stadi indipendenti, entrambi configurabili:
+1. **Soft (`SUBSCRIPTION_TTL_DAYS`, default 4gg):** lo scan si ferma per l'utente scaduto, che riceve un avviso; **le sue ricerche non vengono toccate**.
+2. **Hard (`DEEP_CLEAN_RETENTION_DAYS`, default 30gg):** solo dopo questo periodo, molto più lungo, l'utente e le sue ricerche vengono cancellati definitivamente. I superuser non sono mai soggetti a questa cancellazione.
 
 ## License
 This project is licensed under the **GNU General Public License v3 (GPLv3)**. 

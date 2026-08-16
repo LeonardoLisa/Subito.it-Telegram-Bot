@@ -1,0 +1,13 @@
+# Runtime dependencies for Subito.it Telegram Bot.
+# Pinned to the versions currently validated in the project's .venv for
+# reproducible installs. Update deliberately, not implicitly via `pip install -U`.
+#
+# Install with:
+#   pip install -r requirements.txt
+# or, with uv:
+#   uv pip install -r requirements.txt
+
+curl_cffi==0.15.0
+pillow==12.2.0
+python-dotenv==1.2.2
+requests==2.34.2

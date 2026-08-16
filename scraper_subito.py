@@ -38,14 +38,25 @@ def get_or_create_environment_id() -> str:
     """
     Retrieves the persistent environment UUID from disk or generates a new one.
     Simulates the initial application installation state to bypass WAF anti-rotation rules.
+
+    Per SubitoReverse/Results.md (5.2 "Ciclo di vita degli Identificatori"), the
+    `x-subito-environment-id` MUST remain invariant for the entire lifetime of the
+    bot installation, or DataDome's anti-rotation heuristics may treat every
+    restart as a brand new device install. Every code path below that ends up
+    generating a NEW id therefore falls through to the same write-to-disk step,
+    so a fresh id is always persisted exactly once, never silently discarded.
     """
     if os.path.exists(ENV_FILE):
-        with open(ENV_FILE, 'r') as f:
-            try:
+        try:
+            with open(ENV_FILE, 'r') as f:
                 data = json.load(f)
-                return data.get("environment_id", str(uuid.uuid4()))
-            except json.JSONDecodeError:
-                pass
+            # `data` might be valid JSON that isn't a dict (e.g. a bare string or
+            # array), or a dict missing the "environment_id" key entirely.
+            env_id = data.get("environment_id") if isinstance(data, dict) else None
+            if env_id:
+                return env_id
+        except (json.JSONDecodeError, OSError):
+            pass
     
     new_env_id = str(uuid.uuid4())
     with open(ENV_FILE, 'w') as f:
@@ -59,6 +70,20 @@ def generate_session_id() -> str:
     return str(uuid.uuid4())
 
 class SubitoScraper:
+    # Deliberately NOT an exhaustive map of every Subito.it category: Subito has
+    # dozens of categories/subcategories and keeping a full slug->id table in sync
+    # would be fragile. Only the categories we can confidently map are listed here;
+    # for anything else the Mobile API query is simply left unfiltered by category
+    # (broader results), and `/add` link validation is what actually verifies the
+    # link points to a real, existing Subito.it search page (see telegram_ui.py).
+    CATEGORY_MAP = {
+        '/informatica/': '10',
+        '/console-videogiochi/': '73',
+        '/telefonia/': '15',
+        '/auto/': '2',
+        '/moto-e-scooter/': '3',
+    }
+
     def __init__(self):
         self.api_url = "https://hades.subito.it/v1/search/items"
         self.debug_mode = False
@@ -107,15 +132,23 @@ class SubitoScraper:
         if 'q' in qs:
             params['q'] = qs['q']
             
-        # Map path fragments to primary category IDs
+        # Map path fragments to primary category IDs (best-effort, see CATEGORY_MAP note above)
         path = parsed.path
-        if '/informatica/' in path: params['c'] = '10'
-        elif '/console-videogiochi/' in path: params['c'] = '73'
-        elif '/telefonia/' in path: params['c'] = '15'
-        elif '/auto/' in path: params['c'] = '2'
-        elif '/moto-e-scooter/' in path: params['c'] = '3'
+        for slug, category_id in self.CATEGORY_MAP.items():
+            if slug in path:
+                params['c'] = category_id
+                break
         
         return params
+
+    @classmethod
+    def is_category_recognized(cls, web_url: str) -> bool:
+        """
+        Returns True if the URL's category slug is one we can map to a Subito
+        category id for the Mobile API. Does not perform any network request.
+        """
+        path = urlparse(web_url).path
+        return any(slug in path for slug in cls.CATEGORY_MAP)
 
     def fetch_ads(self, url: str) -> list:
         """
@@ -230,6 +263,37 @@ class SubitoScraper:
             return f"https://s.sbito.it/images/{shard}/{img_id}.jpg"
             
         return uri
+
+    def verify_waf_bypass(self):
+        """
+        Performs a minimal request against the Hades Mobile API to confirm that
+        the current TLS-impersonated session actually evades the DataDome/
+        ThreatMetrix WAF, instead of assuming it silently. Meant to be called
+        once at daemon startup so main.py can fail fast (and loudly) instead of
+        scanning for hours with a session that's actually being blocked.
+
+        Returns a (ok: bool, reason: str) tuple. `reason` is empty when ok is True.
+        """
+        test_params = {"sort": "datedesc", "t": "s", "shp": "true", "lim": "1", "pin": "0,0,0"}
+        try:
+            res = self.session.get(self.api_url, params=test_params, timeout=15)
+        except Exception as e:
+            return False, f"network exception: {e}"
+
+        if res.status_code == 200:
+            try:
+                data = res.json()
+            except Exception:
+                return False, "HTTP 200 but response body is not valid JSON"
+            if isinstance(data, dict) and "ads" in data:
+                return True, ""
+            return False, "HTTP 200 but unexpected response shape (WAF may be serving a challenge page)"
+
+        if res.status_code == 403:
+            return False, "HTTP 403 - WAF (DataDome) block"
+        if res.status_code == 429:
+            return False, "HTTP 429 - rate limited"
+        return False, f"unexpected HTTP {res.status_code}"
 
     def download_image(self, image_url: str) -> bytes:
         """

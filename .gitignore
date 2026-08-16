@@ -32,6 +32,12 @@
 *.db-shm
 *.db-wal
 
+# Local DB backup artifacts (may contain sensitive user data, per-machine only)
+*.bak
+
+# Local WAF trust/installation state (per-machine, not meant to be versioned)
+.subito_env.json
+
 # Python Standard Ignores
 __pycache__/
 *.py[cod]

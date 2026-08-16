@@ -17,18 +17,25 @@ the Free Software Foundation, either version 3 of the License, or
 
 from curl_cffi import requests as cffi_requests
 import requests
+import os
 import time
 import html
 import uuid
 import json
 import re
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+from concurrent.futures import ThreadPoolExecutor
+
+from scraper_subito import SubitoScraper
 
 class TelegramUI:
-    TIMEOUT_SECONDS = 4 * 24 * 3600  # 96 hours
-    CACHE_PRUNE_INTERVAL = 1800      # 30 minutes
-    MAX_REGULAR_SEARCHES = 15        # Maximum allowed searches for regular users
-    MAX_SUBSCRIBERS = 3              # Maximum number of total allowed users
+    # Defaults, all overridable via .env - see README "Configurazione avanzata via .env".
+    DEFAULT_SUBSCRIPTION_TTL_DAYS = 4
+    DEFAULT_CACHE_PRUNE_INTERVAL_SECONDS = 1800
+    DEFAULT_MAX_REGULAR_SEARCHES = 15
+    DEFAULT_MAX_SUBSCRIBERS = 3
+    DEFAULT_MAX_EXCLUSION_KEYWORDS = 3
+    DEFAULT_MAX_INCLUDE_KEYWORDS = 3
 
     def __init__(self, token, db, shutdown_event):
         self.token = token
@@ -39,13 +46,27 @@ class TelegramUI:
         self.callback_cache = {}
         self.start_time = time.time()
         self.last_cache_prune = time.time()
+
+        self.TIMEOUT_SECONDS = int(os.getenv("SUBSCRIPTION_TTL_DAYS", str(self.DEFAULT_SUBSCRIPTION_TTL_DAYS))) * 24 * 3600
+        self.CACHE_PRUNE_INTERVAL = int(os.getenv("CACHE_PRUNE_INTERVAL_SECONDS", str(self.DEFAULT_CACHE_PRUNE_INTERVAL_SECONDS)))
+        self.MAX_REGULAR_SEARCHES = int(os.getenv("MAX_REGULAR_SEARCHES", str(self.DEFAULT_MAX_REGULAR_SEARCHES)))
+        self.MAX_SUBSCRIBERS = int(os.getenv("MAX_SUBSCRIBERS", str(self.DEFAULT_MAX_SUBSCRIBERS)))
+        self.MAX_EXCLUSION_KEYWORDS = int(os.getenv("MAX_EXCLUSION_KEYWORDS", str(self.DEFAULT_MAX_EXCLUSION_KEYWORDS)))
+        self.MAX_INCLUDE_KEYWORDS = int(os.getenv("MAX_INCLUDE_KEYWORDS", str(self.DEFAULT_MAX_INCLUDE_KEYWORDS)))
+
+        # /add link validation involves a network round-trip (up to ~10s). Running it here
+        # instead of inline keeps the single-threaded poll_updates loop free to serve other users.
+        self._add_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="add-validate")
         
     def _debug_print(self, error_msg):
         if self.debug_mode:
             print(f"\033[91m[TG_UI ERROR] {error_msg}\033[0m")
 
-    def _get_uptime_string(self):
-        delta = int(time.time() - self.start_time)
+    @staticmethod
+    def _format_duration(seconds):
+        """Formats a duration in seconds as e.g. '1y 2mo 3d 4h 5m'. Shared by the
+        uptime display and the /status remaining-subscription-time display."""
+        delta = max(0, int(seconds))
         y, rem = divmod(delta, 31536000)
         mo, rem = divmod(rem, 2592000)
         d, rem = divmod(rem, 86400)
@@ -63,6 +84,9 @@ class TelegramUI:
             if m > 0 or not parts: parts.append(f"{m}m")
             
         return " ".join(parts)
+
+    def _get_uptime_string(self):
+        return self._format_duration(time.time() - self.start_time)
 
     def _prune_internal_memory(self):
         now = time.time()
@@ -92,6 +116,156 @@ class TelegramUI:
             return True
         except Exception:
             return False
+
+    def _validate_and_prompt_category(self, chat_id, link):
+        """
+        Runs off the Telegram polling thread (submitted via `_add_executor`) so that
+        validating a /add link never blocks updates for other users. Actually performs
+        the request against Subito.it to verify the link leads to an existing, real
+        search page, rather than trying to keep an exhaustive category-id map in sync.
+        """
+        try:
+            check_res = cffi_requests.get(
+                link,
+                impersonate="safari15_3",
+                timeout=10,
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "none",
+                    "Referer": "https://www.google.com/"
+                }
+            )
+            if check_res.status_code != 200:
+                self.send_direct_message(chat_id, f"⚠️ <b>Error:</b> Link unreachable (HTTP {check_res.status_code}).")
+                return
+            if '__NEXT_DATA__' not in check_res.text:
+                self.send_direct_message(chat_id, "⚠️ <b>Error:</b> Not a valid Subito.it search page.")
+                return
+        except Exception as e:
+            self._debug_print(f"Link Validation Error: {e}")
+            self.send_direct_message(chat_id, "⚠️ <b>Network Error:</b> Validation failed. Try again.")
+            return
+
+        searches = self.db.get_user_searches(chat_id)
+        keyboard = {"inline_keyboard": []}
+        for cat in searches.keys():
+            cb_data = self._create_callback_data({"action": "addcat", "cat": cat})
+            keyboard["inline_keyboard"].append([{"text": f"📁 {cat}", "callback_data": cb_data}])
+
+        cb_new = self._create_callback_data({"action": "addcat", "cat": "new"})
+        cb_cancel = self._create_callback_data({"action": "cancel"})
+        keyboard["inline_keyboard"].append([{"text": "➕ New Category", "callback_data": cb_new}])
+        keyboard["inline_keyboard"].append([{"text": "❌ Cancel", "callback_data": cb_cancel}])
+
+        with self.db.lock:
+            self.user_states[chat_id] = {"state": "waiting_category", "link": link, "timestamp": time.time()}
+
+        self.send_direct_message(chat_id, "📂 Choose a macro category or create a new one:", reply_markup=keyboard)
+
+    def _validate_and_update_url(self, chat_id, search_name, new_link):
+        """
+        Background counterpart of `_validate_and_prompt_category` used when editing
+        the URL of an EXISTING search: verifies the new link is a real Subito.it
+        search page, then updates the search in place (preserving its tracked-ads
+        history) instead of going through the add/category-selection flow.
+        """
+        try:
+            check_res = cffi_requests.get(
+                new_link,
+                impersonate="safari15_3",
+                timeout=10,
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "none",
+                    "Referer": "https://www.google.com/"
+                }
+            )
+            if check_res.status_code != 200:
+                self.send_direct_message(chat_id, f"⚠️ <b>Error:</b> Link unreachable (HTTP {check_res.status_code}). The search was NOT modified.")
+                return
+            if '__NEXT_DATA__' not in check_res.text:
+                self.send_direct_message(chat_id, "⚠️ <b>Error:</b> Not a valid Subito.it search page. The search was NOT modified.")
+                return
+        except Exception as e:
+            self._debug_print(f"URL edit validation error: {e}")
+            self.send_direct_message(chat_id, "⚠️ <b>Network Error:</b> Validation failed. The search was NOT modified.")
+            return
+
+        self.db.update_search(chat_id, search_name, url=new_link)
+        confirmation = f"✅ URL updated for search <b>{html.escape(search_name)}</b>."
+        if not SubitoScraper.is_category_recognized(new_link):
+            confirmation += (
+                "\n\nℹ️ This category isn't fully supported by the internal filter: "
+                "results for this search may be broader than expected."
+            )
+        self.send_direct_message(chat_id, confirmation)
+
+    def _render_search_menu(self, chat_id, message_id, cat_name, search_name):
+        """
+        Renders (or re-renders, after a pause/resume toggle) the detail menu for a
+        single search: status, filters, and the Pause/Resume, Edit, Delete, Copy
+        Link, Open Link and Back actions.
+        """
+        edit_url = f"https://api.telegram.org/bot{self.token}/editMessageText"
+        searches = self.db.get_user_searches(chat_id)
+
+        target_item = None
+        if cat_name in searches:
+            for item in searches[cat_name]:
+                if item['name'] == search_name:
+                    target_item = item
+                    break
+
+        if not target_item:
+            try:
+                requests.post(edit_url, json={"chat_id": chat_id, "message_id": message_id, "text": "⚠️ Search not found.", "parse_mode": "HTML"}, timeout=5)
+            except Exception:
+                pass
+            return
+
+        url = target_item['url']
+        enabled = target_item.get('enabled', True)
+
+        msg_text = (
+            f"📂 <b>Category:</b> {html.escape(cat_name)}\n"
+            f"🔍 <b>Search:</b> {html.escape(search_name)}\n"
+            f"{'▶️ <b>Status:</b> Active' if enabled else '⏸️ <b>Status:</b> Paused'}\n"
+        )
+        if target_item['exclusion_kws']:
+            excl = ", ".join(target_item['exclusion_kws'])
+            msg_text += f"🚫 <b>Exclusions:</b> {html.escape(excl)}\n"
+        if target_item.get('include_kws'):
+            incl = ", ".join(target_item['include_kws'])
+            msg_text += f"✅ <b>Includes:</b> {html.escape(incl)}\n"
+
+        # Mantenuto per il tap-to-copy sui client vecchi
+        msg_text += f"\n🔗 <b>Direct Link:</b>\n<code>{html.escape(url)}</code>"
+
+        cb_toggle = self._create_callback_data({"action": "toggle_enabled", "cat": cat_name, "name": search_name})
+        cb_edit = self._create_callback_data({"action": "edit_menu", "cat": cat_name, "name": search_name})
+        cb_rm = self._create_callback_data({"action": "rmconf", "name": search_name})
+        cb_back = self._create_callback_data({"action": "cat", "cat": cat_name})
+
+        toggle_label = "⏸️ Pause" if enabled else "▶️ Resume"
+        keyboard = {"inline_keyboard": [
+            [{"text": toggle_label, "callback_data": cb_toggle}],
+            [{"text": "✏️ Edit", "callback_data": cb_edit}],
+            [{"text": "🗑️ Delete", "callback_data": cb_rm}],
+            [{"text": "🔗 Copy Link", "copy_text": {"text": url}}],
+            [{"text": "🌐 Open Link", "url": url}],
+            [{"text": "🔙 Back", "callback_data": cb_back}],
+        ]}
+
+        try:
+            requests.post(edit_url, json={"chat_id": chat_id, "message_id": message_id, "text": msg_text, "parse_mode": "HTML", "reply_markup": keyboard}, timeout=5)
+        except Exception as e:
+            self._debug_print(f"Search menu render error: {e}")
 
     def clear_offline_updates(self):
         url = f"https://api.telegram.org/bot{self.token}/getUpdates"
@@ -276,53 +450,28 @@ class TelegramUI:
                 elif link.startswith("http://"):
                     link = link.replace("http://", "https://", 1)
                 
-                # Automatically enforce &order=datedesc parameter
+                # Searches are always saved sorted by "most recent" (order=datedesc).
+                # A price-based order is explicitly rejected instead of being silently
+                # overwritten, so the user isn't surprised by a search that behaves
+                # differently than the link they submitted.
                 parsed_link = urlparse(link)
                 query_params = dict(parse_qsl(parsed_link.query))
+                requested_order = query_params.get('order', '').strip().lower()
+                if requested_order in ('pricedesc', 'priceasc'):
+                    self.send_direct_message(
+                        chat_id,
+                        "⚠️ <b>Error:</b> Price-based sorting (<code>order=priceasc</code>/<code>order=pricedesc</code>) is not supported.\n"
+                        "Searches are always saved sorted by <b>most recent</b>. Remove the 'order' parameter from the link and try again."
+                    )
+                    return
                 query_params['order'] = 'datedesc'
                 new_query = urlencode(query_params)
                 link = urlunparse((parsed_link.scheme, parsed_link.netloc, parsed_link.path, parsed_link.params, new_query, parsed_link.fragment))
-                    
-                try:
-                    check_res = cffi_requests.get(
-                        link, 
-                        impersonate="safari15_3", 
-                        timeout=10,
-                        headers={
-                            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                            "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
-                            "Sec-Fetch-Dest": "document",
-                            "Sec-Fetch-Mode": "navigate",
-                            "Sec-Fetch-Site": "none",
-                            "Referer": "https://www.google.com/"
-                        }
-                    )
-                    if check_res.status_code != 200:
-                        self.send_direct_message(chat_id, f"⚠️ <b>Error:</b> Link unreachable (HTTP {check_res.status_code}).")
-                        return
-                    if '__NEXT_DATA__' not in check_res.text:
-                        self.send_direct_message(chat_id, "⚠️ <b>Error:</b> Not a valid Subito.it search page.")
-                        return
-                except Exception as e:
-                    self._debug_print(f"Link Validation Error: {e}")
-                    self.send_direct_message(chat_id, "⚠️ <b>Network Error:</b> Validation failed. Try again.")
-                    return
-                    
-                searches = self.db.get_user_searches(chat_id)
-                keyboard = {"inline_keyboard": []}
-                for cat in searches.keys():
-                    cb_data = self._create_callback_data({"action": "addcat", "cat": cat})
-                    keyboard["inline_keyboard"].append([{"text": f"📁 {cat}", "callback_data": cb_data}])
-                
-                cb_new = self._create_callback_data({"action": "addcat", "cat": "new"})
-                cb_cancel = self._create_callback_data({"action": "cancel"})
-                keyboard["inline_keyboard"].append([{"text": "➕ New Category", "callback_data": cb_new}])
-                keyboard["inline_keyboard"].append([{"text": "❌ Cancel", "callback_data": cb_cancel}])
-                
-                with self.db.lock:
-                    self.user_states[chat_id] = {"state": "waiting_category", "link": link, "timestamp": time.time()}
-                    
-                self.send_direct_message(chat_id, "📂 Choose a macro category or create a new one:", reply_markup=keyboard)
+
+                # Validating the link requires a network round-trip (up to ~10s). Run it in a
+                # background worker so this single-threaded update loop keeps serving other users.
+                self.send_direct_message(chat_id, "🔎 <i>Verifying link, please wait...</i>")
+                self._add_executor.submit(self._validate_and_prompt_category, chat_id, link)
 
             elif text.startswith("/rm"):
                 parts = text.split(" ", 1)
@@ -351,17 +500,31 @@ class TelegramUI:
                     
                     self.send_direct_message(chat_id, f"🗑️ <b>Select search to delete:</b>\nSearch Name: {html.escape(search_name)}", reply_markup=keyboard)
 
+            elif text.startswith("/broadcast"):
+                if not is_superuser:
+                    self.send_direct_message(chat_id, "⚠️ <b>Action Denied.</b>\nOnly superusers can use this command.")
+                    return
+                parts = text.split(" ", 1)
+                if len(parts) < 2 or not parts[1].strip():
+                    self.send_direct_message(chat_id, "⚠️ <b>Usage:</b> /broadcast &lt;message&gt;")
+                    return
+                broadcast_text = parts[1].strip()
+                self.broadcast(f"📢 <b>Announcement</b>\n\n{broadcast_text}")
+                self.send_direct_message(chat_id, "✅ Broadcast sent to all users.")
+
             elif text == "/help":
                 help_text = (
                     "🤖 <b>Available Commands</b>\n\n"
                     "✅ <b>/sub</b> - Subscribe to receive alerts.\n"
                     "❌ <b>/unsub</b> - Unsubscribe and delete your data.\n"
-                    "🔎 <b>/search</b> - View active searches.\n"
+                    "🔎 <b>/search</b> - View active searches (pause/resume/edit from there).\n"
                     "➕ <b>/add &lt;link&gt;</b> - Add a new search.\n"
                     "🗑️ <b>/rm &lt;Search Name&gt;</b> - Remove a search.\n"
                     "📊 <b>/status</b> - View system status.\n"
                     "🛑 <b>/cancel</b> - Abort current action."
                 )
+                if is_superuser:
+                    help_text += "\n📢 <b>/broadcast &lt;message&gt;</b> - Send a message to all users (superuser only)."
                 self.send_direct_message(chat_id, help_text)
 
             elif text == "/status":
@@ -374,6 +537,13 @@ class TelegramUI:
                 
                 if not is_superuser:
                     status_msg += f"/{self.MAX_REGULAR_SEARCHES}"
+                    remaining = self.TIMEOUT_SECONDS - (time.time() - user_data['last_active'])
+                    if remaining > 0:
+                        status_msg += f"\nSubscription expires in: {self._format_duration(remaining)}"
+                    else:
+                        status_msg += "\nSubscription: expired (send /sub to renew)"
+                else:
+                    status_msg += "\nSubscription: Unlimited (superuser)"
                     
                 self.send_direct_message(chat_id, status_msg)
 
@@ -415,31 +585,109 @@ class TelegramUI:
                     self.send_direct_message(
                         chat_id, 
                         f"Search Name set to '<b>{html.escape(new_kw)}</b>'.\n\n"
-                        f"Optional: Send up to 3 <b>exclusion keywords</b> separated by commas (e.g. broken, parts, not working).\n"
+                        f"Optional: Send up to {self.MAX_EXCLUSION_KEYWORDS} <b>exclusion keywords</b> separated by commas (e.g. broken, parts, not working).\n"
                         f"Send <b>NONE</b> to skip this step."
                     )
                         
                 elif state_data["state"] == "waiting_exclusion":
                     excl_input = text.strip().lower()
-                    cat = state_data["category"]
-                    link = state_data["link"]
-                    name = state_data["name"]
                     
                     exclusion_list = []
                     if excl_input != "none":
                         raw_list = [k.strip() for k in excl_input.split(',')]
-                        exclusion_list = [k for k in raw_list if k][:3] # Take up to 3 valid keywords
+                        exclusion_list = [k for k in raw_list if k][:self.MAX_EXCLUSION_KEYWORDS]
                     
-                    self.db.add_search(chat_id, cat, name, link, exclusion_list)
+                    with self.db.lock:
+                        self.user_states[chat_id]["state"] = "waiting_include"
+                        self.user_states[chat_id]["exclusion_kws"] = exclusion_list
+                    
+                    self.send_direct_message(
+                        chat_id,
+                        f"Optional: Send up to {self.MAX_INCLUDE_KEYWORDS} <b>include keywords</b> separated by commas: "
+                        f"an ad is only notified if its title contains at least one of them (e.g. new, sealed).\n"
+                        f"Send <b>NONE</b> to skip this step and match any title."
+                    )
+
+                elif state_data["state"] == "waiting_include":
+                    incl_input = text.strip().lower()
+                    cat = state_data["category"]
+                    link = state_data["link"]
+                    name = state_data["name"]
+                    exclusion_list = state_data.get("exclusion_kws", [])
+
+                    include_list = []
+                    if incl_input != "none":
+                        raw_list = [k.strip() for k in incl_input.split(',')]
+                        include_list = [k for k in raw_list if k][:self.MAX_INCLUDE_KEYWORDS]
+
+                    self.db.add_search(chat_id, cat, name, link, exclusion_list, include_list)
                     
                     with self.db.lock:
                         del self.user_states[chat_id]
                         
                     excl_str = ", ".join(exclusion_list) if exclusion_list else "None"
-                    self.send_direct_message(
-                        chat_id, 
-                        f"✅ <b>Added!</b>\n📂 Category: {html.escape(cat)}\n🔑 Search Name: {html.escape(name)}\n🚫 Exclusions: {html.escape(excl_str)}"
+                    incl_str = ", ".join(include_list) if include_list else "None"
+                    confirmation = (
+                        f"✅ <b>Added!</b>\n📂 Category: {html.escape(cat)}\n🔑 Search Name: {html.escape(name)}\n"
+                        f"🚫 Exclusions: {html.escape(excl_str)}\n✅ Includes: {html.escape(incl_str)}"
                     )
+                    if not SubitoScraper.is_category_recognized(link):
+                        confirmation += (
+                            "\n\nℹ️ This category isn't fully supported by the internal filter: "
+                            "results for this search may be broader than expected."
+                        )
+                    self.send_direct_message(chat_id, confirmation)
+
+                elif state_data["state"] == "editing_field":
+                    field = state_data["field"]
+                    search_name = state_data["name"]
+
+                    if field == "url":
+                        new_link = text.strip()
+                        if not self._is_valid_subito_url(new_link):
+                            self.send_direct_message(chat_id, "⚠️ <b>Error:</b> Invalid Subito.it link.")
+                            return
+                        if not new_link.startswith("http://") and not new_link.startswith("https://"):
+                            new_link = "https://" + new_link
+                        elif new_link.startswith("http://"):
+                            new_link = new_link.replace("http://", "https://", 1)
+
+                        parsed_link = urlparse(new_link)
+                        query_params = dict(parse_qsl(parsed_link.query))
+                        requested_order = query_params.get('order', '').strip().lower()
+                        if requested_order in ('pricedesc', 'priceasc'):
+                            self.send_direct_message(
+                                chat_id,
+                                "⚠️ <b>Error:</b> Price-based sorting is not supported. Remove 'order' from the link and try again."
+                            )
+                            return
+                        query_params['order'] = 'datedesc'
+                        new_query = urlencode(query_params)
+                        new_link = urlunparse((parsed_link.scheme, parsed_link.netloc, parsed_link.path, parsed_link.params, new_query, parsed_link.fragment))
+
+                        with self.db.lock:
+                            del self.user_states[chat_id]
+
+                        self.send_direct_message(chat_id, "🔎 <i>Verifying new link, please wait...</i>")
+                        self._add_executor.submit(self._validate_and_update_url, chat_id, search_name, new_link)
+
+                    elif field == "exclusion":
+                        raw = text.strip().lower()
+                        kw_list = [] if raw == "none" else [k.strip() for k in raw.split(',') if k.strip()][:self.MAX_EXCLUSION_KEYWORDS]
+                        self.db.update_search(chat_id, search_name, exclusion_kws=kw_list)
+                        with self.db.lock:
+                            del self.user_states[chat_id]
+                        kw_str = ", ".join(kw_list) if kw_list else "None"
+                        self.send_direct_message(chat_id, f"✅ Exclusion keywords updated: {html.escape(kw_str)}")
+
+                    elif field == "include":
+                        raw = text.strip().lower()
+                        kw_list = [] if raw == "none" else [k.strip() for k in raw.split(',') if k.strip()][:self.MAX_INCLUDE_KEYWORDS]
+                        self.db.update_search(chat_id, search_name, include_kws=kw_list)
+                        with self.db.lock:
+                            del self.user_states[chat_id]
+                        kw_str = ", ".join(kw_list) if kw_list else "None"
+                        self.send_direct_message(chat_id, f"✅ Include keywords updated: {html.escape(kw_str)}")
 
         elif "callback_query" in update:
             cb = update["callback_query"]
@@ -504,52 +752,71 @@ class TelegramUI:
                             requests.post(edit_url, json={"chat_id": chat_id, "message_id": message_id, "text": f"📂 <b>{html.escape(cat_name)}</b>\nSelect a search:", "parse_mode": "HTML", "reply_markup": keyboard}, timeout=5)
                         except Exception as e:
                             self._debug_print(f"Cat cb error: {e}")
+                    else:
+                        try:
+                            requests.post(edit_url, json={"chat_id": chat_id, "message_id": message_id, "text": f"⚠️ <b>{html.escape(cat_name)}</b> è stata eliminata perché non contiene più ricerche.", "parse_mode": "HTML"}, timeout=5)
+                        except Exception as e:
+                            self._debug_print(f"Empty cat cb error: {e}")
                 
                 elif action == "search_menu":
+                    self._render_search_menu(chat_id, message_id, cb_info["cat"], cb_info["name"])
+
+                elif action == "toggle_enabled":
                     cat_name = cb_info["cat"]
                     search_name = cb_info["name"]
                     searches = self.db.get_user_searches(chat_id)
-                    
-                    target_item = None
+                    current = None
                     if cat_name in searches:
                         for item in searches[cat_name]:
                             if item['name'] == search_name:
-                                target_item = item
+                                current = item
                                 break
-                                
-                    if target_item:
-                        url = target_item['url']
-                        
-                        msg_text = (
-                            f"📂 <b>Category:</b> {html.escape(cat_name)}\n"
-                            f"🔍 <b>Search:</b> {html.escape(search_name)}\n"
-                        )
-                        
-                        if target_item['exclusion_kws']:
-                            excl = ", ".join(target_item['exclusion_kws'])
-                            msg_text += f"🚫 <b>Exclusions:</b> {html.escape(excl)}\n"
-                            
-                        # Mantenuto per il tap-to-copy sui client vecchi
-                        msg_text += f"\n🔗 <b>Direct Link:</b>\n<code>{html.escape(url)}</code>"
-                        
-                        keyboard = {"inline_keyboard": []}
-                        cb_rm = self._create_callback_data({"action": "rmconf", "name": search_name})
-                        cb_back = self._create_callback_data({"action": "cat", "cat": cat_name})
-                        
-                        # Aggiunta dei bottoni in verticale
-                        keyboard["inline_keyboard"].append([{"text": "🗑️ Delete", "callback_data": cb_rm}])
-                        keyboard["inline_keyboard"].append([{"text": "🔗 Copy Link", "copy_text": {"text": url}}])
-                        keyboard["inline_keyboard"].append([{"text": "🌐 Open Link", "url": url}])
-                        keyboard["inline_keyboard"].append([{"text": "🔙 Back", "callback_data": cb_back}])
-                        
-                        try:
-                            requests.post(edit_url, json={"chat_id": chat_id, "message_id": message_id, "text": msg_text, "parse_mode": "HTML", "reply_markup": keyboard}, timeout=5)
-                        except Exception as e:
-                            self._debug_print(f"Search menu cb error: {e}")
-                    else:
-                        try: requests.post(edit_url, json={"chat_id": chat_id, "message_id": message_id, "text": "⚠️ Search not found.", "parse_mode": "HTML"}, timeout=5)
-                        except: pass
-                        
+                    if current is not None:
+                        self.db.set_search_enabled(chat_id, search_name, not current.get('enabled', True))
+                    self._render_search_menu(chat_id, message_id, cat_name, search_name)
+
+                elif action == "edit_menu":
+                    cat_name = cb_info["cat"]
+                    search_name = cb_info["name"]
+                    cb_url = self._create_callback_data({"action": "edit_field", "cat": cat_name, "name": search_name, "field": "url"})
+                    cb_excl = self._create_callback_data({"action": "edit_field", "cat": cat_name, "name": search_name, "field": "exclusion"})
+                    cb_incl = self._create_callback_data({"action": "edit_field", "cat": cat_name, "name": search_name, "field": "include"})
+                    cb_back = self._create_callback_data({"action": "search_menu", "cat": cat_name, "name": search_name})
+                    keyboard = {"inline_keyboard": [
+                        [{"text": "🔗 Edit URL", "callback_data": cb_url}],
+                        [{"text": "🚫 Edit exclusions", "callback_data": cb_excl}],
+                        [{"text": "✅ Edit includes", "callback_data": cb_incl}],
+                        [{"text": "🔙 Back", "callback_data": cb_back}],
+                    ]}
+                    try:
+                        requests.post(edit_url, json={"chat_id": chat_id, "message_id": message_id, "text": f"✏️ <b>Editing:</b> {html.escape(search_name)}\nWhat do you want to change?", "parse_mode": "HTML", "reply_markup": keyboard}, timeout=5)
+                    except Exception as e:
+                        self._debug_print(f"Edit menu cb error: {e}")
+
+                elif action == "edit_field":
+                    cat_name = cb_info["cat"]
+                    search_name = cb_info["name"]
+                    field = cb_info["field"]
+
+                    with self.db.lock:
+                        self.user_states[chat_id] = {
+                            "state": "editing_field",
+                            "field": field,
+                            "cat": cat_name,
+                            "name": search_name,
+                            "timestamp": time.time(),
+                        }
+
+                    prompts = {
+                        "url": "🔗 Send the new Subito.it link for this search:",
+                        "exclusion": f"🚫 Send up to {self.MAX_EXCLUSION_KEYWORDS} exclusion keywords separated by commas, or NONE to clear them:",
+                        "include": f"✅ Send up to {self.MAX_INCLUDE_KEYWORDS} include keywords separated by commas, or NONE to clear them:",
+                    }
+                    try:
+                        requests.post(edit_url, json={"chat_id": chat_id, "message_id": message_id, "text": prompts.get(field, "Send the new value:"), "parse_mode": "HTML"}, timeout=5)
+                    except Exception as e:
+                        self._debug_print(f"Edit field cb error: {e}")
+
                 elif action == "addcat":
                     cat_name = cb_info["cat"]
                     with self.db.lock:
@@ -575,9 +842,24 @@ class TelegramUI:
                             
                 elif action == "rmconf":
                     name = cb_info["name"]
+
+                    # Categories aren't a stored entity: they only exist implicitly through
+                    # searches. Figure out which category owned this search BEFORE deleting
+                    # it, so we can tell the user if that category effectively disappeared.
+                    removed_category = None
+                    for cat, items in self.db.get_user_searches(chat_id).items():
+                        if any(item['name'] == name for item in items):
+                            removed_category = cat
+                            break
+
                     self.db.remove_search(chat_id, name)
+
+                    confirm_text = f"✅ Search <b>{html.escape(name)}</b> deleted."
+                    if removed_category and removed_category not in self.db.get_user_searches(chat_id):
+                        confirm_text += f"\n🗑️ Category <b>{html.escape(removed_category)}</b> has been removed because it no longer contains any searches."
+
                     try: 
-                        requests.post(edit_url, json={"chat_id": chat_id, "message_id": message_id, "text": f"✅ Search <b>{html.escape(name)}</b> deleted.", "parse_mode": "HTML"}, timeout=5)
+                        requests.post(edit_url, json={"chat_id": chat_id, "message_id": message_id, "text": confirm_text, "parse_mode": "HTML"}, timeout=5)
                     except Exception as e:
                         self._debug_print(f"Rmconf cb error: {e}")
 

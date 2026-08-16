@@ -38,6 +38,7 @@ from dotenv import load_dotenv
 from database import Database
 from scraper_subito import SubitoScraper
 from telegram_ui import TelegramUI
+from superuser_cli import run_superuser_menu
 
 class Colors:
     HEADER = '\033[95m'
@@ -87,7 +88,7 @@ def format_message(category, name, ad):
         f"📂 <b>{html.escape(category)}</b> | 🔍 <i>{html.escape(name)}</i>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>{html.escape(ad['title'])}</b>\n"
-        f"💶 Price: € {html.escape(ad['price'])}\n"
+        f"💶 Price: {html.escape(ad['price'])}\n"
         f"📍 Location: {html.escape(ad['location'])}\n\n"
         f"📝 <i>{html.escape(desc)}</i>"
     )
@@ -102,6 +103,7 @@ def main():
     parser.add_argument('--refreshrate', '-r', type=int, default=120, help="Scan interval")
     parser.add_argument('--debug', '-d', action='store_true', help="Enable verbose logging")
     parser.add_argument('--skip', '-s', action='store_true', help="Skip initial notifications")
+    parser.add_argument('--superuser', '-su', action='store_true', help="Open the interactive superuser management menu before starting")
     args = parser.parse_args()
 
     DEBUG_MODE = args.debug
@@ -112,12 +114,27 @@ def main():
         log("ERROR: TELEGRAM_BOT_TOKEN missing in .env", Colors.FAIL)
         sys.exit(1)
 
-    db = Database()
+    # --- Configurable limits (see README "Configurazione avanzata via .env") ---
+    db_path = os.getenv("DB_PATH", "subito_bot.db")
+    deep_clean_retention_days = int(os.getenv("DEEP_CLEAN_RETENTION_DAYS", "30"))
+    tracked_ads_max_items = int(os.getenv("TRACKED_ADS_MAX_ITEMS", "150"))
+
+    db = Database(db_path=db_path)
     db.debug_mode = DEBUG_MODE
-    
+
+    if args.superuser:
+        run_superuser_menu(db, token)
+
     scraper = SubitoScraper()
     scraper.debug_mode = DEBUG_MODE
-    
+
+    log("Verifying WAF bypass before starting...", Colors.OKCYAN)
+    waf_ok, waf_reason = scraper.verify_waf_bypass()
+    if not waf_ok:
+        log(f"FATAL: WAF bypass check failed ({waf_reason}). Aborting startup.", Colors.FAIL)
+        sys.exit(1)
+    log("WAF bypass verified successfully.", Colors.OKGREEN)
+
     tg = TelegramUI(token, db, shutdown_event)
     tg.debug_mode = DEBUG_MODE
 
@@ -135,8 +152,9 @@ def main():
             time.sleep(10)
             continue
 
-        # Trigger deep clean for 34-day inactive users
-        retention_seconds = 34 * 86400
+        # Trigger deep clean for long-term inactive users (separate from, and much
+        # longer than, the soft subscription expiry below).
+        retention_seconds = deep_clean_retention_days * 86400
         db.prune_inactive_users(retention_seconds)
 
         searches = db.get_all_searches()
@@ -150,10 +168,19 @@ def main():
             name = s['name']
             url = s['url']
             exclusion_kws = s['exclusion_kws']
+            include_kws = s.get('include_kws') or []
             last_active = s['last_active']
             is_superuser = s['is_superuser']
 
-            # Enforce 4-day active subscription limit (bypassed for superusers)
+            # Paused searches (see /add search menu "Pause") are skipped entirely,
+            # without consuming a scraper request, but keep their tracked-ads history.
+            if not s.get('enabled', True):
+                debug_log(f"Skipping paused search: [User {chat_id}] {category} -> {name}")
+                continue
+
+            # Enforce soft active-subscription limit (bypassed for superusers). Expired
+            # users' searches are left untouched here — they are only ever hard-deleted
+            # by prune_inactive_users() above, after the much longer deep-clean retention.
             if not is_superuser and (time.time() - last_active > tg.TIMEOUT_SECONDS):
                 if chat_id not in notified_expired_users:
                     days_valid = tg.TIMEOUT_SECONDS // 86400
@@ -170,10 +197,7 @@ def main():
             ads = scraper.fetch_ads(url)
 
             # Determine if this is a newly created search to prevent initial spam
-            with db.lock:
-                with db._get_connection() as conn:
-                    cursor = conn.execute("SELECT 1 FROM tracked_ads WHERE search_id = ? LIMIT 1", (search_id,))
-                    is_new_search = (cursor.fetchone() is None)
+            is_new_search = not db.has_tracked_ads(search_id)
 
             for ad in ads:
                 title_lower = ad['title'].lower()
@@ -184,7 +208,16 @@ def main():
                         debug_log(f"Ad excluded by keyword: {ad['title']}")
                         continue
 
-                ad_id = ad['link']
+                # Apply inclusion filter: if any include keywords are set, the ad's
+                # title must contain at least one of them to be notified.
+                if include_kws:
+                    if not any(kw.lower().strip() in title_lower for kw in include_kws if kw.strip()):
+                        debug_log(f"Ad skipped (no include keyword match): {ad['title']}")
+                        continue
+
+                # Prefer the stable URN-derived ad id over the display link, which can
+                # change (redirects, tracking params) for an ad that was already seen.
+                ad_id = ad.get('id') or ad['link']
                 if not db.is_ad_tracked(search_id, ad_id):
                     if not skip_next and not is_new_search:
                         img = scraper.download_image(ad['image_url'])
@@ -201,7 +234,7 @@ def main():
             debug_log(f"Applying jitter: {jitter:.2f}s")
             time.sleep(jitter)
 
-        db.trim_tracked_items(max_items=150)
+        db.trim_tracked_items(max_items=tracked_ads_max_items)
         skip_next = False
 
         if not shutdown_event.is_set():
