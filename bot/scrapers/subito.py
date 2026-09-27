@@ -1,5 +1,5 @@
 """
-Filename: scraper_subito.py
+Filename: bot/scrapers/subito.py
 Version: 4.0.0
 Date: 2026-05-28
 Author: Leonardo Lisa
@@ -31,6 +31,8 @@ from urllib.parse import urlparse, parse_qsl
 from curl_cffi import requests as cffi_requests
 from PIL import Image
 from io import BytesIO
+
+from .base import BaseScraper
 
 ENV_FILE = ".subito_env.json"
 
@@ -69,13 +71,13 @@ def generate_session_id() -> str:
     """
     return str(uuid.uuid4())
 
-class SubitoScraper:
+class SubitoScraper(BaseScraper):
     # Deliberately NOT an exhaustive map of every Subito.it category: Subito has
     # dozens of categories/subcategories and keeping a full slug->id table in sync
     # would be fragile. Only the categories we can confidently map are listed here;
     # for anything else the Mobile API query is simply left unfiltered by category
-    # (broader results), and `/add` link validation is what actually verifies the
-    # link points to a real, existing Subito.it search page (see telegram_ui.py).
+    # (broader results), and link validation is what actually verifies the
+    # link points to a real, existing Subito.it search page (see bot/telegram_ui.py).
     CATEGORY_MAP = {
         '/informatica/': '10',
         '/console-videogiochi/': '73',

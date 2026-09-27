@@ -7,8 +7,9 @@ Description: Integration tests covering the fixes applied to database.py,
                - trim_tracked_items() parameter binding
                - has_tracked_ads() replacing raw connection access from main.py
                - SubitoScraper category recognition (no full category map)
-               - Non-blocking /add flow, price-order rejection, category
-                 recognized notice, category-deletion notification
+               - Non-blocking button-driven add flow ("+ Add Category"/"+ Add
+                 Search"), price-order rejection, category recognized notice,
+                 category-deletion notification
 
 Run with:
     python3 -m unittest discover -s tests -v
@@ -22,15 +23,16 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch, MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from database import Database
-from scraper_subito import SubitoScraper
-from telegram_ui import TelegramUI
-import main as main_module
+from bot.database import Database
+from bot.scrapers.subito import SubitoScraper
+from bot.telegram_ui import TelegramUI
+from bot import daemon as main_module
 
 
 # ---------------------------------------------------------------------------
@@ -68,7 +70,7 @@ class TestDatabaseConnectionLifecycle(unittest.TestCase):
         _TrackingConnection.tracker = {"opened": 0, "closed": 0}
 
     def test_every_opened_connection_is_closed(self):
-        with patch("database.sqlite3.connect", side_effect=_connect_with_tracking):
+        with patch("bot.database.sqlite3.connect", side_effect=_connect_with_tracking):
             db = Database(db_path=self.db_path)
             db.register_user(111)
             db.add_search(111, "Cat", "Search 1", "https://www.subito.it/x", [])
@@ -348,7 +350,7 @@ class TestScraperEnvIdAndWafCheck(unittest.TestCase):
         with open(".subito_env.json", "w") as f:
             json.dump({"unrelated_key": "value"}, f)
 
-        from scraper_subito import get_or_create_environment_id
+        from bot.scrapers.subito import get_or_create_environment_id
         result = get_or_create_environment_id()
 
         self.assertTrue(result)
@@ -361,7 +363,7 @@ class TestScraperEnvIdAndWafCheck(unittest.TestCase):
         with open(".subito_env.json", "w") as f:
             json.dump(["not", "a", "dict"], f)
 
-        from scraper_subito import get_or_create_environment_id
+        from bot.scrapers.subito import get_or_create_environment_id
         result = get_or_create_environment_id()  # must not raise AttributeError
 
         with open(".subito_env.json") as f:
@@ -372,7 +374,7 @@ class TestScraperEnvIdAndWafCheck(unittest.TestCase):
         with open(".subito_env.json", "w") as f:
             f.write("{not valid json")
 
-        from scraper_subito import get_or_create_environment_id
+        from bot.scrapers.subito import get_or_create_environment_id
         result = get_or_create_environment_id()
 
         with open(".subito_env.json") as f:
@@ -383,7 +385,7 @@ class TestScraperEnvIdAndWafCheck(unittest.TestCase):
         with open(".subito_env.json", "w") as f:
             json.dump({"environment_id": "fixed-id-123"}, f)
 
-        from scraper_subito import get_or_create_environment_id
+        from bot.scrapers.subito import get_or_create_environment_id
         self.assertEqual(get_or_create_environment_id(), "fixed-id-123")
         self.assertEqual(get_or_create_environment_id(), "fixed-id-123")
 
@@ -418,18 +420,259 @@ class TestScraperEnvIdAndWafCheck(unittest.TestCase):
         self.assertIn("boom", reason)
 
 
+class TestI18n(unittest.TestCase):
+    """Regression tests for bot/i18n.py's t() lookup/format helper."""
+
+    def test_defaults_to_english(self):
+        from bot.i18n import t
+        self.assertEqual(t("btn_close"), "❌ Close")
+
+    def test_returns_italian_variant(self):
+        from bot.i18n import t
+        self.assertEqual(t("btn_close", "it"), "❌ Chiudi")
+
+    def test_unknown_language_falls_back_to_english(self):
+        from bot.i18n import t
+        self.assertEqual(t("btn_close", "fr"), "❌ Close")
+
+    def test_unknown_key_returns_key_itself(self):
+        from bot.i18n import t
+        self.assertEqual(t("totally_unknown_key", "en"), "totally_unknown_key")
+
+    def test_placeholders_are_formatted(self):
+        from bot.i18n import t
+        self.assertEqual(t("sub_active_days", "en", days=4), "✅ Subscription active for 4 days.")
+        self.assertEqual(t("sub_active_days", "it", days=4), "✅ Abbonamento attivo per 4 giorni.")
+
+    def test_missing_placeholder_falls_back_to_unformatted_text_without_raising(self):
+        from bot.i18n import t
+        # Deliberately omit the required `days` kwarg; must not raise KeyError.
+        result = t("sub_active_days", "en")
+        self.assertIn("{days}", result)
+
+
+class TestDatabaseLanguage(unittest.TestCase):
+    """Regression tests for the users.language column (report item 3)."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmpdir, "lang_test.db")
+        self.db = Database(db_path=self.db_path)
+
+    def test_new_user_defaults_to_english(self):
+        self.db.register_user(1)
+        self.assertEqual(self.db.get_user(1)["language"], "en")
+
+    def test_set_language_persists(self):
+        self.db.register_user(2)
+        self.db.set_language(2, "it")
+        self.assertEqual(self.db.get_user(2)["language"], "it")
+
+    def test_get_all_searches_includes_language(self):
+        self.db.register_user(3)
+        self.db.set_language(3, "it")
+        self.db.add_search(3, "Cat", "S1", "https://www.subito.it/x", [])
+        row = self.db.get_all_searches()[0]
+        self.assertEqual(row["language"], "it")
+
+    def test_legacy_db_without_language_column_migrates_to_english_default(self):
+        legacy_path = os.path.join(self.tmpdir, "legacy_lang.db")
+        conn = sqlite3.connect(legacy_path)
+        conn.execute('''
+            CREATE TABLE users (
+                chat_id INTEGER PRIMARY KEY,
+                joined_at REAL NOT NULL,
+                last_active REAL NOT NULL,
+                is_superuser INTEGER DEFAULT 0
+            )
+        ''')
+        conn.execute(
+            "INSERT INTO users (chat_id, joined_at, last_active, is_superuser) VALUES (1, 0, 0, 0)"
+        )
+        conn.commit()
+        conn.close()
+
+        migrated_db = Database(db_path=legacy_path)
+        self.assertEqual(migrated_db.get_user(1)["language"], "en")
+
+
+class TestDatabaseSentNotifications(unittest.TestCase):
+    """Regression tests for sent_notifications tracking (report item 5: auto-delete
+    old ad notification messages)."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmpdir, "notif_test.db")
+        self.db = Database(db_path=self.db_path)
+
+    def test_record_and_fetch_expired_notification(self):
+        self.db.record_sent_notification(chat_id=1, message_id=100)
+        future_cutoff = time.time() + 3600
+        expired = self.db.get_expired_notifications(future_cutoff)
+        self.assertEqual(len(expired), 1)
+        self.assertEqual(expired[0]["chat_id"], 1)
+        self.assertEqual(expired[0]["message_id"], 100)
+
+    def test_recent_notification_is_not_expired(self):
+        self.db.record_sent_notification(chat_id=1, message_id=100)
+        past_cutoff = time.time() - 3600
+        expired = self.db.get_expired_notifications(past_cutoff)
+        self.assertEqual(expired, [])
+
+    def test_delete_notification_record_removes_row(self):
+        self.db.record_sent_notification(chat_id=1, message_id=100)
+        future_cutoff = time.time() + 3600
+        record_id = self.db.get_expired_notifications(future_cutoff)[0]["id"]
+        self.db.delete_notification_record(record_id)
+        self.assertEqual(self.db.get_expired_notifications(future_cutoff), [])
+
+
+class TestDatabaseBans(unittest.TestCase):
+    """Regression tests for banned_users tracking (report item 8: permanent bans)."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmpdir, "ban_test.db")
+        self.db = Database(db_path=self.db_path)
+
+    def test_is_banned_false_by_default(self):
+        self.assertFalse(self.db.is_banned(1))
+
+    def test_ban_and_unban_user(self):
+        self.db.ban_user(1, reason="test")
+        self.assertTrue(self.db.is_banned(1))
+
+        self.db.unban_user(1)
+        self.assertFalse(self.db.is_banned(1))
+
+    def test_ban_survives_unsub(self):
+        """A ban must not use a FK/cascade to `users`, so it survives /unsub (which
+        deletes the users row) - otherwise an abuser could reset via /unsub + /sub."""
+        self.db.register_user(1)
+        self.db.ban_user(1, reason="abuse")
+
+        self.db.remove_user(1)
+
+        self.assertIsNone(self.db.get_user(1))
+        self.assertTrue(self.db.is_banned(1))
+
+    def test_get_all_banned_includes_unregistered_chat_ids(self):
+        self.db.ban_user(999, reason="pre-emptive")
+        banned = self.db.get_all_banned()
+        self.assertEqual(len(banned), 1)
+        self.assertEqual(banned[0]["chat_id"], 999)
+        self.assertEqual(banned[0]["reason"], "pre-emptive")
+
+    def test_ban_user_is_idempotent_and_updates_reason(self):
+        self.db.ban_user(1, reason="first")
+        self.db.ban_user(1, reason="second")
+        banned = self.db.get_all_banned()
+        self.assertEqual(len(banned), 1)
+        self.assertEqual(banned[0]["reason"], "second")
+
+
+class TestPurgeExpiredAdNotifications(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmpdir, "purge_test.db")
+        self.db = Database(db_path=self.db_path)
+        self.tg = TelegramUI("dummy-token", self.db, threading.Event())
+
+    @patch("bot.telegram_ui.requests.post")
+    def test_purge_deletes_only_expired_messages(self, mock_post):
+        mock_post.return_value = _mock_ok_response()
+        old_cutoff_time = time.time() - (self.tg.AD_NOTIFICATION_RETENTION_DAYS * 86400) - 10
+        with self.db._connection() as conn:
+            conn.execute(
+                "INSERT INTO sent_notifications (chat_id, message_id, sent_at) VALUES (?, ?, ?)",
+                (1, 111, old_cutoff_time),
+            )
+            conn.execute(
+                "INSERT INTO sent_notifications (chat_id, message_id, sent_at) VALUES (?, ?, ?)",
+                (2, 222, time.time()),
+            )
+            conn.commit()
+
+        self.tg.purge_expired_ad_notifications()
+
+        delete_calls = [c for c in mock_post.call_args_list if "deleteMessage" in c.args[0]]
+        self.assertEqual(len(delete_calls), 1)
+        self.assertEqual(delete_calls[0].kwargs["json"]["message_id"], 111)
+
+        future_cutoff = time.time() + 3600
+        remaining = self.db.get_expired_notifications(future_cutoff)
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0]["message_id"], 222)
+
+    @patch("bot.telegram_ui.requests.post")
+    def test_purge_drops_db_record_even_if_telegram_delete_fails(self, mock_post):
+        mock_post.side_effect = Exception("network down")
+        old_time = time.time() - (self.tg.AD_NOTIFICATION_RETENTION_DAYS * 86400) - 10
+        self.db.record_sent_notification(chat_id=1, message_id=999)
+        with self.db._connection() as conn:
+            conn.execute("UPDATE sent_notifications SET sent_at = ?", (old_time,))
+            conn.commit()
+
+        self.tg.purge_expired_ad_notifications()
+
+        future_cutoff = time.time() + 3600
+        self.assertEqual(self.db.get_expired_notifications(future_cutoff), [])
+
+    @patch("bot.telegram_ui.requests.post")
+    def test_send_ad_registers_notification_for_future_purge(self, mock_post):
+        mock_post.return_value = _mock_ok_response({"ok": True, "result": {"message_id": 42}})
+        self.tg.send_ad(chat_id=555, msg_text="hello")
+
+        future_cutoff = time.time() + 3600
+        recorded = self.db.get_expired_notifications(future_cutoff)
+        self.assertEqual(len(recorded), 1)
+        self.assertEqual(recorded[0]["message_id"], 42)
+
+
 class TestMainDedupeAndFormatting(unittest.TestCase):
-    def test_format_message_escapes_html_and_truncates_description(self):
+    def _ad(self, **overrides):
         ad = {
+            "id": "ad-1",
             "title": "<script>alert(1)</script>",
             "price": "100",
             "location": "Roma",
             "description": "x" * 300,
         }
-        msg = main_module.format_message("Cat", "Name", ad)
+        ad.update(overrides)
+        return ad
+
+    def test_format_message_escapes_html_and_truncates_description(self):
+        msg = main_module.format_message([("Cat", "Name")], self._ad())
         self.assertNotIn("<script>", msg)
         self.assertIn("&lt;script&gt;", msg)
         self.assertIn("...", msg)
+
+    def test_format_message_includes_ad_id_on_first_line(self):
+        msg = main_module.format_message([("Cat", "Name")], self._ad(id="999888"))
+        first_line = msg.splitlines()[0]
+        self.assertIn("#999888", first_line)
+
+    def test_format_message_omits_id_line_when_ad_has_no_id(self):
+        ad = self._ad()
+        del ad["id"]
+        msg = main_module.format_message([("Cat", "Name")], ad)
+        self.assertNotIn("#", msg.splitlines()[0])
+
+    def test_format_message_single_match_has_no_also_found_by_line(self):
+        msg = main_module.format_message([("Cat", "Name")], self._ad())
+        self.assertNotIn("Also found by", msg)
+
+    def test_format_message_multiple_matches_lists_extra_search_names(self):
+        msg = main_module.format_message([("Cat", "Name1"), ("Cat2", "Name2")], self._ad())
+        self.assertIn("Also found by", msg)
+        self.assertIn("Name2", msg)
+        # The first match's category/name still drive the header line.
+        self.assertIn("Name1", msg.splitlines()[0])
+
+    def test_format_message_translates_price_and_location_labels(self):
+        msg_it = main_module.format_message([("Cat", "Name")], self._ad(), lang="it")
+        self.assertIn("Prezzo", msg_it)
+        self.assertIn("Posizione", msg_it)
 
     def test_dedupe_prefers_stable_ad_id_over_link(self):
         """The daemon loop must dedupe using ad['id'] (URN-derived) with a fallback
@@ -438,6 +681,52 @@ class TestMainDedupeAndFormatting(unittest.TestCase):
         ad_without_id = {"id": "", "link": "https://www.subito.it/x/2.htm"}
         self.assertEqual(ad_with_id.get("id") or ad_with_id["link"], "abc123")
         self.assertEqual(ad_without_id.get("id") or ad_without_id["link"], ad_without_id["link"])
+
+
+class TestSendAdAndEditAdMessage(unittest.TestCase):
+    """Regression tests for TelegramUI.send_ad()'s return value and the new
+    edit_ad_message() used by the cross-search dedup flow (report item 1)."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmpdir, "send_ad_test.db")
+        self.db = Database(db_path=self.db_path)
+        self.tg = TelegramUI("dummy-token", self.db, threading.Event())
+        self.chat_id = 4242
+
+    @patch("bot.telegram_ui.requests.post")
+    def test_send_ad_text_only_returns_message_id_and_is_photo_false(self, mock_post):
+        mock_post.return_value = _mock_ok_response({"ok": True, "result": {"message_id": 55}})
+        result = self.tg.send_ad(self.chat_id, "hello", item_url="https://www.subito.it/x")
+        self.assertEqual(result, {"message_id": 55, "is_photo": False})
+
+    @patch("bot.telegram_ui.requests.post")
+    def test_send_ad_with_image_returns_is_photo_true(self, mock_post):
+        mock_post.return_value = _mock_ok_response({"ok": True, "result": {"message_id": 77}})
+        result = self.tg.send_ad(self.chat_id, "hello", image_bytes=b"fake-jpeg")
+        self.assertEqual(result, {"message_id": 77, "is_photo": True})
+
+    @patch("bot.telegram_ui.requests.post")
+    def test_send_ad_returns_none_on_api_failure(self, mock_post):
+        mock_post.return_value = _mock_ok_response({"ok": False, "description": "boom"})
+        result = self.tg.send_ad(self.chat_id, "hello")
+        self.assertIsNone(result)
+
+    @patch("bot.telegram_ui.requests.post")
+    def test_edit_ad_message_uses_caption_endpoint_for_photos(self, mock_post):
+        mock_post.return_value = _mock_ok_response()
+        self.tg.edit_ad_message(self.chat_id, 55, "updated text", is_photo=True)
+        called_url = mock_post.call_args[0][0]
+        self.assertIn("editMessageCaption", called_url)
+        self.assertEqual(mock_post.call_args.kwargs["json"]["caption"], "updated text")
+
+    @patch("bot.telegram_ui.requests.post")
+    def test_edit_ad_message_uses_text_endpoint_for_text_messages(self, mock_post):
+        mock_post.return_value = _mock_ok_response()
+        self.tg.edit_ad_message(self.chat_id, 55, "updated text", is_photo=False)
+        called_url = mock_post.call_args[0][0]
+        self.assertIn("editMessageText", called_url)
+        self.assertEqual(mock_post.call_args.kwargs["json"]["text"], "updated text")
 
 
 def _mock_ok_response(json_payload=None):
@@ -458,60 +747,153 @@ class TestTelegramUIAddFlow(unittest.TestCase):
     def _text_update(self, text):
         return {"message": {"chat": {"id": self.chat_id}, "text": text}}
 
-    @patch("telegram_ui.requests.post")
+    def _callback_update(self, cb_data, message_id=1):
+        return {
+            "callback_query": {
+                "id": "cbq1",
+                "message": {"chat": {"id": self.chat_id}, "message_id": message_id},
+                "data": cb_data,
+            }
+        }
+
+    @patch("bot.telegram_ui.requests.post")
+    def test_search_menu_shows_add_category_button(self, mock_post):
+        mock_post.return_value = _mock_ok_response()
+        self.tg._process_update(self._text_update("/search"))
+
+        sent_calls = [c.kwargs["json"] for c in mock_post.call_args_list if "json" in c.kwargs and "text" in c.kwargs["json"]]
+        keyboard = sent_calls[-1]["reply_markup"]["inline_keyboard"]
+        button_texts = [btn["text"] for row in keyboard for btn in row]
+        self.assertTrue(any("Add Category" in t for t in button_texts))
+
+    @patch("bot.telegram_ui.requests.post")
+    def test_start_add_category_callback_prompts_for_link(self, mock_post):
+        mock_post.return_value = _mock_ok_response()
+        cb_data = self.tg._create_callback_data({"action": "start_add_category"})
+
+        self.tg._process_update(self._callback_update(cb_data))
+
+        self.assertEqual(self.tg.user_states[self.chat_id]["state"], "waiting_link_for_new_category")
+        sent_texts = [c.kwargs["json"]["text"] for c in mock_post.call_args_list if "json" in c.kwargs and "text" in c.kwargs["json"]]
+        self.assertTrue(any("link" in t.lower() for t in sent_texts))
+
+    @patch("bot.telegram_ui.requests.post")
+    def test_start_add_search_callback_prompts_for_link_with_category_preset(self, mock_post):
+        mock_post.return_value = _mock_ok_response()
+        self.db.add_search(self.chat_id, "ExistingCat", "S1", "https://www.subito.it/x", [])
+        cb_data = self.tg._create_callback_data({"action": "start_add_search", "cat": "ExistingCat"})
+
+        self.tg._process_update(self._callback_update(cb_data))
+
+        self.assertEqual(self.tg.user_states[self.chat_id]["state"], "waiting_link_for_category")
+        self.assertEqual(self.tg.user_states[self.chat_id]["category"], "ExistingCat")
+
+    @patch("bot.telegram_ui.requests.post")
+    def test_start_add_category_denied_when_limit_reached(self, mock_post):
+        mock_post.return_value = _mock_ok_response()
+        self.tg.MAX_REGULAR_SEARCHES = 1
+        self.db.add_search(self.chat_id, "Cat", "S1", "https://www.subito.it/x", [])
+        cb_data = self.tg._create_callback_data({"action": "start_add_category"})
+
+        self.tg._process_update(self._callback_update(cb_data))
+
+        self.assertNotIn(self.chat_id, self.tg.user_states)
+        alert_calls = [
+            c.kwargs["json"] for c in mock_post.call_args_list
+            if "json" in c.kwargs and c.kwargs["json"].get("show_alert")
+        ]
+        self.assertTrue(any("Limit" in c["text"] for c in alert_calls))
+
+    @patch("bot.telegram_ui.requests.post")
     def test_add_rejects_price_based_order(self, mock_post):
         mock_post.return_value = _mock_ok_response()
+        with self.db.lock:
+            self.tg.user_states[self.chat_id] = {
+                "state": "waiting_link_for_new_category", "timestamp": __import__("time").time(),
+            }
         with patch.object(self.tg, "_add_executor") as mock_executor:
             self.tg._process_update(
-                self._text_update("/add https://www.subito.it/annunci-italia/vendita/informatica/?order=pricedesc")
+                self._text_update("https://www.subito.it/annunci-italia/vendita/informatica/?order=pricedesc")
             )
             mock_executor.submit.assert_not_called()
 
         sent_texts = [c.kwargs["json"]["text"] for c in mock_post.call_args_list if "json" in c.kwargs and "text" in c.kwargs["json"]]
         self.assertTrue(any("priceasc" in t or "pricedesc" in t or "Price-based" in t for t in sent_texts))
 
-    @patch("telegram_ui.requests.post")
+    @patch("bot.telegram_ui.requests.post")
     def test_add_enforces_datedesc_and_runs_validation_in_background(self, mock_post):
         mock_post.return_value = _mock_ok_response()
+        with self.db.lock:
+            self.tg.user_states[self.chat_id] = {
+                "state": "waiting_link_for_new_category", "timestamp": __import__("time").time(),
+            }
         with patch.object(self.tg, "_add_executor") as mock_executor:
             self.tg._process_update(
-                self._text_update("/add https://www.subito.it/annunci-italia/vendita/informatica/?q=pc")
+                self._text_update("https://www.subito.it/annunci-italia/vendita/informatica/?q=pc")
             )
             mock_executor.submit.assert_called_once()
             args = mock_executor.submit.call_args[0]
             # Bound methods compare equal via `==` (same underlying function + instance)
             # even though separate attribute accesses create distinct bound-method objects.
-            self.assertEqual(args[0], self.tg._validate_and_prompt_category)
+            self.assertEqual(args[0], self.tg._validate_link_and_proceed)
             submitted_link = args[2]
             self.assertIn("order=datedesc", submitted_link)
+            self.assertIsNone(args[3])
 
-    @patch("telegram_ui.cffi_requests.get")
-    @patch("telegram_ui.requests.post")
-    def test_validate_and_prompt_category_success_sets_state(self, mock_post, mock_cffi_get):
+    @patch("bot.telegram_ui.requests.post")
+    def test_add_search_link_step_carries_preset_category_to_validation(self, mock_post):
+        mock_post.return_value = _mock_ok_response()
+        with self.db.lock:
+            self.tg.user_states[self.chat_id] = {
+                "state": "waiting_link_for_category", "category": "ExistingCat",
+                "timestamp": __import__("time").time(),
+            }
+        with patch.object(self.tg, "_add_executor") as mock_executor:
+            self.tg._process_update(
+                self._text_update("https://www.subito.it/annunci-italia/vendita/informatica/?q=pc")
+            )
+            args = mock_executor.submit.call_args[0]
+            self.assertEqual(args[3], "ExistingCat")
+
+    @patch("bot.telegram_ui.cffi_requests.get")
+    @patch("bot.telegram_ui.requests.post")
+    def test_validate_link_and_proceed_success_sets_new_category_name_state(self, mock_post, mock_cffi_get):
         mock_post.return_value = _mock_ok_response()
         mock_cffi_get.return_value = MagicMock(status_code=200, text="...__NEXT_DATA__...")
 
         link = "https://www.subito.it/annunci-italia/vendita/informatica/?q=pc&order=datedesc"
-        self.tg._validate_and_prompt_category(self.chat_id, link)
+        self.tg._validate_link_and_proceed(self.chat_id, link)
 
         self.assertIn(self.chat_id, self.tg.user_states)
-        self.assertEqual(self.tg.user_states[self.chat_id]["state"], "waiting_category")
+        self.assertEqual(self.tg.user_states[self.chat_id]["state"], "waiting_new_cat_name")
         self.assertEqual(self.tg.user_states[self.chat_id]["link"], link)
 
-    @patch("telegram_ui.cffi_requests.get")
-    @patch("telegram_ui.requests.post")
-    def test_validate_and_prompt_category_rejects_unreachable_link(self, mock_post, mock_cffi_get):
+    @patch("bot.telegram_ui.cffi_requests.get")
+    @patch("bot.telegram_ui.requests.post")
+    def test_validate_link_and_proceed_with_target_category_skips_category_step(self, mock_post, mock_cffi_get):
+        mock_post.return_value = _mock_ok_response()
+        mock_cffi_get.return_value = MagicMock(status_code=200, text="...__NEXT_DATA__...")
+
+        link = "https://www.subito.it/annunci-italia/vendita/informatica/?q=pc&order=datedesc"
+        self.tg._validate_link_and_proceed(self.chat_id, link, target_category="ExistingCat")
+
+        self.assertEqual(self.tg.user_states[self.chat_id]["state"], "waiting_keyword")
+        self.assertEqual(self.tg.user_states[self.chat_id]["category"], "ExistingCat")
+
+    @patch("bot.telegram_ui.cffi_requests.get")
+    @patch("bot.telegram_ui.requests.post")
+    def test_validate_link_and_proceed_rejects_unreachable_link(self, mock_post, mock_cffi_get):
         mock_post.return_value = _mock_ok_response()
         mock_cffi_get.return_value = MagicMock(status_code=404, text="not found")
 
         link = "https://www.subito.it/annunci-italia/vendita/informatica/?q=pc"
-        self.tg._validate_and_prompt_category(self.chat_id, link)
+        self.tg._validate_link_and_proceed(self.chat_id, link)
 
         self.assertNotIn(self.chat_id, self.tg.user_states)
         sent_texts = [c.kwargs["json"]["text"] for c in mock_post.call_args_list if "json" in c.kwargs and "text" in c.kwargs["json"]]
         self.assertTrue(any("unreachable" in t.lower() for t in sent_texts))
 
-    @patch("telegram_ui.requests.post")
+    @patch("bot.telegram_ui.requests.post")
     def test_add_flow_exclusion_step_prompts_for_include_keywords(self, mock_post):
         """The exclusion step no longer finalizes the search directly: it now
         transitions to a new include-keywords step before saving."""
@@ -533,7 +915,7 @@ class TestTelegramUIAddFlow(unittest.TestCase):
         self.assertEqual(self.tg.user_states[self.chat_id]["exclusion_kws"], ["broken", "parts"])
         self.assertEqual(self.db.get_user_searches(self.chat_id), {}, "search must not be saved yet")
 
-    @patch("telegram_ui.requests.post")
+    @patch("bot.telegram_ui.requests.post")
     def test_add_search_confirmation_warns_for_unrecognized_category(self, mock_post):
         mock_post.return_value = _mock_ok_response()
         link = "https://www.subito.it/annunci-italia/vendita/arredamento-casalinghi/?order=datedesc"
@@ -555,7 +937,7 @@ class TestTelegramUIAddFlow(unittest.TestCase):
         self.assertTrue(any("fully supported" in t for t in sent_texts))
         self.assertIn("Casa", self.db.get_user_searches(self.chat_id))
 
-    @patch("telegram_ui.requests.post")
+    @patch("bot.telegram_ui.requests.post")
     def test_add_search_confirmation_no_warning_for_recognized_category(self, mock_post):
         mock_post.return_value = _mock_ok_response()
         link = "https://www.subito.it/annunci-italia/vendita/informatica/?order=datedesc"
@@ -576,7 +958,7 @@ class TestTelegramUIAddFlow(unittest.TestCase):
         self.assertTrue(any("Added" in t for t in sent_texts))
         self.assertFalse(any("fully supported" in t for t in sent_texts))
 
-    @patch("telegram_ui.requests.post")
+    @patch("bot.telegram_ui.requests.post")
     def test_add_search_finalize_stores_include_keywords(self, mock_post):
         mock_post.return_value = _mock_ok_response()
         link = "https://www.subito.it/annunci-italia/vendita/informatica/?order=datedesc"
@@ -618,7 +1000,7 @@ class TestTelegramUICallbacks(unittest.TestCase):
             }
         }
 
-    @patch("telegram_ui.requests.post")
+    @patch("bot.telegram_ui.requests.post")
     def test_cat_callback_reports_when_category_no_longer_exists(self, mock_post):
         mock_post.return_value = _mock_ok_response()
         cb_data = self.tg._create_callback_data({"action": "cat", "cat": "GhostCategory"})
@@ -628,7 +1010,7 @@ class TestTelegramUICallbacks(unittest.TestCase):
         sent_texts = [c.kwargs["json"]["text"] for c in mock_post.call_args_list if "json" in c.kwargs and "text" in c.kwargs["json"]]
         self.assertTrue(any("GhostCategory" in t and ("eliminata" in t or "no longer") for t in sent_texts))
 
-    @patch("telegram_ui.requests.post")
+    @patch("bot.telegram_ui.requests.post")
     def test_rmconf_notifies_category_deletion_when_last_search_removed(self, mock_post):
         mock_post.return_value = _mock_ok_response()
         self.db.add_search(self.chat_id, "SoloCat", "OnlySearch", "https://www.subito.it/x", [])
@@ -641,7 +1023,7 @@ class TestTelegramUICallbacks(unittest.TestCase):
         self.assertTrue(any("SoloCat" in t and "removed" in t for t in sent_texts))
         self.assertEqual(self.db.get_user_searches(self.chat_id), {})
 
-    @patch("telegram_ui.requests.post")
+    @patch("bot.telegram_ui.requests.post")
     def test_rmconf_does_not_notify_category_deletion_when_siblings_remain(self, mock_post):
         mock_post.return_value = _mock_ok_response()
         self.db.add_search(self.chat_id, "SharedCat", "SearchA", "https://www.subito.it/a", [])
@@ -654,6 +1036,39 @@ class TestTelegramUICallbacks(unittest.TestCase):
         self.assertTrue(any("SearchA" in t and "deleted" in t for t in sent_texts))
         self.assertFalse(any("removed because it no longer" in t for t in sent_texts))
         self.assertIn("SharedCat", self.db.get_user_searches(self.chat_id))
+
+    @patch("bot.telegram_ui.requests.post")
+    def test_language_command_shows_flag_buttons(self, mock_post):
+        mock_post.return_value = _mock_ok_response()
+        self.tg._process_update({"message": {"chat": {"id": self.chat_id}, "text": "/language"}})
+
+        sent_calls = [c.kwargs["json"] for c in mock_post.call_args_list if "json" in c.kwargs and "text" in c.kwargs["json"]]
+        self.assertTrue(sent_calls)
+        keyboard = sent_calls[-1]["reply_markup"]["inline_keyboard"]
+        button_texts = [btn["text"] for row in keyboard for btn in row]
+        self.assertTrue(any("English" in t for t in button_texts))
+        self.assertTrue(any("Italiano" in t for t in button_texts))
+
+    @patch("bot.telegram_ui.requests.post")
+    def test_setlang_callback_persists_language_and_confirms_in_new_language(self, mock_post):
+        mock_post.return_value = _mock_ok_response()
+        cb_data = self.tg._create_callback_data({"action": "setlang", "lang": "it"})
+
+        self.tg._process_update(self._callback_update(cb_data))
+
+        self.assertEqual(self.db.get_user(self.chat_id)["language"], "it")
+        sent_texts = [c.kwargs["json"]["text"] for c in mock_post.call_args_list if "json" in c.kwargs and "text" in c.kwargs["json"]]
+        self.assertTrue(any("Italiano" in t for t in sent_texts))
+
+    @patch("bot.telegram_ui.requests.post")
+    def test_subsequent_messages_use_persisted_language(self, mock_post):
+        mock_post.return_value = _mock_ok_response()
+        self.db.set_language(self.chat_id, "it")
+
+        self.tg._process_update({"message": {"chat": {"id": self.chat_id}, "text": "/unsub"}})
+
+        sent_texts = [c.kwargs["json"]["text"] for c in mock_post.call_args_list if "json" in c.kwargs and "text" in c.kwargs["json"]]
+        self.assertTrue(any("Disiscritto" in t for t in sent_texts))
 
 
 class TestTelegramUISearchManagement(unittest.TestCase):
@@ -681,7 +1096,7 @@ class TestTelegramUISearchManagement(unittest.TestCase):
     def _text_update(self, text):
         return {"message": {"chat": {"id": self.chat_id}, "text": text}}
 
-    @patch("telegram_ui.requests.post")
+    @patch("bot.telegram_ui.requests.post")
     def test_toggle_enabled_pauses_and_resumes_search(self, mock_post):
         mock_post.return_value = _mock_ok_response()
         cb_data = self.tg._create_callback_data({"action": "toggle_enabled", "cat": "Cat", "name": "S1"})
@@ -696,7 +1111,7 @@ class TestTelegramUISearchManagement(unittest.TestCase):
         self.tg._process_update(self._callback_update(cb_data_2))
         self.assertTrue(self.db.get_user_searches(self.chat_id)["Cat"][0]["enabled"])
 
-    @patch("telegram_ui.requests.post")
+    @patch("bot.telegram_ui.requests.post")
     def test_edit_menu_shows_field_choices(self, mock_post):
         mock_post.return_value = _mock_ok_response()
         cb_data = self.tg._create_callback_data({"action": "edit_menu", "cat": "Cat", "name": "S1"})
@@ -706,7 +1121,7 @@ class TestTelegramUISearchManagement(unittest.TestCase):
         sent_texts = [c.kwargs["json"]["text"] for c in mock_post.call_args_list if "json" in c.kwargs and "text" in c.kwargs["json"]]
         self.assertTrue(any("Editing" in t and "S1" in t for t in sent_texts))
 
-    @patch("telegram_ui.requests.post")
+    @patch("bot.telegram_ui.requests.post")
     def test_edit_field_exclusion_sets_pending_state_and_prompts(self, mock_post):
         mock_post.return_value = _mock_ok_response()
         cb_data = self.tg._create_callback_data({"action": "edit_field", "cat": "Cat", "name": "S1", "field": "exclusion"})
@@ -716,7 +1131,7 @@ class TestTelegramUISearchManagement(unittest.TestCase):
         self.assertEqual(self.tg.user_states[self.chat_id]["state"], "editing_field")
         self.assertEqual(self.tg.user_states[self.chat_id]["field"], "exclusion")
 
-    @patch("telegram_ui.requests.post")
+    @patch("bot.telegram_ui.requests.post")
     def test_editing_field_exclusion_updates_search_in_place(self, mock_post):
         mock_post.return_value = _mock_ok_response()
         sid_before = self.db.get_user_searches(self.chat_id)["Cat"][0]["id"]
@@ -734,7 +1149,7 @@ class TestTelegramUISearchManagement(unittest.TestCase):
         self.assertEqual(item["exclusion_kws"], ["used", "damaged"])
         self.assertNotIn(self.chat_id, self.tg.user_states)
 
-    @patch("telegram_ui.requests.post")
+    @patch("bot.telegram_ui.requests.post")
     def test_editing_field_include_updates_search_in_place(self, mock_post):
         mock_post.return_value = _mock_ok_response()
 
@@ -749,8 +1164,8 @@ class TestTelegramUISearchManagement(unittest.TestCase):
         item = self.db.get_user_searches(self.chat_id)["Cat"][0]
         self.assertEqual(item["include_kws"], ["sealed"])
 
-    @patch("telegram_ui.cffi_requests.get")
-    @patch("telegram_ui.requests.post")
+    @patch("bot.telegram_ui.cffi_requests.get")
+    @patch("bot.telegram_ui.requests.post")
     def test_validate_and_update_url_preserves_search_id_and_history(self, mock_post, mock_cffi_get):
         mock_post.return_value = _mock_ok_response()
         mock_cffi_get.return_value = MagicMock(status_code=200, text="...__NEXT_DATA__...")
@@ -775,7 +1190,7 @@ class TestTelegramUIBroadcastAndStatus(unittest.TestCase):
     def _text_update(self, chat_id, text):
         return {"message": {"chat": {"id": chat_id}, "text": text}}
 
-    @patch("telegram_ui.requests.post")
+    @patch("bot.telegram_ui.requests.post")
     def test_broadcast_denied_for_regular_user(self, mock_post):
         mock_post.return_value = _mock_ok_response()
         self.db.register_user(1)
@@ -787,7 +1202,7 @@ class TestTelegramUIBroadcastAndStatus(unittest.TestCase):
         self.assertTrue(any("Action Denied" in t for t in sent_texts))
         self.assertFalse(any("Hello everyone" in t for t in sent_texts))
 
-    @patch("telegram_ui.requests.post")
+    @patch("bot.telegram_ui.requests.post")
     def test_broadcast_sent_by_superuser_reaches_all_users(self, mock_post):
         mock_post.return_value = _mock_ok_response()
         self.db.register_user(1)
@@ -802,7 +1217,7 @@ class TestTelegramUIBroadcastAndStatus(unittest.TestCase):
         ]
         self.assertEqual(set(recipients), {1, 2})
 
-    @patch("telegram_ui.requests.post")
+    @patch("bot.telegram_ui.requests.post")
     def test_status_shows_remaining_time_for_regular_user(self, mock_post):
         mock_post.return_value = _mock_ok_response()
         self.db.register_user(1)
@@ -812,7 +1227,7 @@ class TestTelegramUIBroadcastAndStatus(unittest.TestCase):
         sent_texts = [c.kwargs["json"]["text"] for c in mock_post.call_args_list if "json" in c.kwargs and "text" in c.kwargs["json"]]
         self.assertTrue(any("expires in" in t for t in sent_texts))
 
-    @patch("telegram_ui.requests.post")
+    @patch("bot.telegram_ui.requests.post")
     def test_status_shows_unlimited_for_superuser(self, mock_post):
         mock_post.return_value = _mock_ok_response()
         self.db.register_user(1)
@@ -822,6 +1237,40 @@ class TestTelegramUIBroadcastAndStatus(unittest.TestCase):
 
         sent_texts = [c.kwargs["json"]["text"] for c in mock_post.call_args_list if "json" in c.kwargs and "text" in c.kwargs["json"]]
         self.assertTrue(any("Unlimited" in t for t in sent_texts))
+
+    @patch("bot.telegram_ui.requests.post")
+    def test_status_shows_active_and_inactive_user_counts(self, mock_post):
+        """Report item 6: /status must break users down into active/inactive instead
+        of a single 'Total Users' figure."""
+        mock_post.return_value = _mock_ok_response()
+        self.db.register_user(1)  # active (just registered)
+        self.db.register_user(2)  # will be made inactive below
+        stale_time = time.time() - (TelegramUI.DEFAULT_SUBSCRIPTION_TTL_DAYS * 86400) - 3600
+        with self.db._connection() as conn:
+            conn.execute("UPDATE users SET last_active = ? WHERE chat_id = ?", (stale_time, 2))
+            conn.commit()
+
+        self.tg._process_update(self._text_update(1, "/status"))
+
+        sent_texts = [c.kwargs["json"]["text"] for c in mock_post.call_args_list if "json" in c.kwargs and "text" in c.kwargs["json"]]
+        self.assertTrue(any("Active Users: 1" in t for t in sent_texts))
+        self.assertTrue(any("Inactive Users: 1" in t for t in sent_texts))
+
+    @patch("bot.telegram_ui.requests.post")
+    def test_status_counts_superuser_as_active_even_if_stale(self, mock_post):
+        mock_post.return_value = _mock_ok_response()
+        self.db.register_user(1)
+        self.db.set_superuser(1, True)
+        stale_time = time.time() - (TelegramUI.DEFAULT_SUBSCRIPTION_TTL_DAYS * 86400) - 3600
+        with self.db._connection() as conn:
+            conn.execute("UPDATE users SET last_active = ? WHERE chat_id = ?", (stale_time, 1))
+            conn.commit()
+
+        self.tg._process_update(self._text_update(1, "/status"))
+
+        sent_texts = [c.kwargs["json"]["text"] for c in mock_post.call_args_list if "json" in c.kwargs and "text" in c.kwargs["json"]]
+        self.assertTrue(any("Active Users: 1" in t for t in sent_texts))
+        self.assertTrue(any("Inactive Users: 0" in t for t in sent_texts))
 
 
 class TestTelegramUIEnvConfig(unittest.TestCase):
@@ -860,6 +1309,128 @@ class TestTelegramUIEnvConfig(unittest.TestCase):
         self.assertEqual(tg.CACHE_PRUNE_INTERVAL, 60)
         self.assertEqual(tg.MAX_EXCLUSION_KEYWORDS, 5)
         self.assertEqual(tg.MAX_INCLUDE_KEYWORDS, 2)
+
+
+class TestTelegramUISecurity(unittest.TestCase):
+    """Regression tests for report item 8 (security audit / permanent bans): ban
+    enforcement, flood guard, oversized-input guard, and length caps."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmpdir, "tg_security_test.db")
+        self.db = Database(db_path=self.db_path)
+        self.tg = TelegramUI("dummy-token", self.db, threading.Event())
+        self.chat_id = 4321
+        self.db.register_user(self.chat_id)
+
+    def _text_update(self, text):
+        return {"message": {"chat": {"id": self.chat_id}, "text": text}}
+
+    def _callback_update(self, cb_data, message_id=1):
+        return {
+            "callback_query": {
+                "id": "cbq1",
+                "message": {"chat": {"id": self.chat_id}, "message_id": message_id},
+                "data": cb_data,
+            }
+        }
+
+    @patch("bot.telegram_ui.requests.post")
+    def test_banned_chat_id_message_is_silently_dropped(self, mock_post):
+        mock_post.return_value = _mock_ok_response()
+        self.db.ban_user(self.chat_id, reason="test")
+
+        self.tg._process_update(self._text_update("/help"))
+
+        mock_post.assert_not_called()
+
+    @patch("bot.telegram_ui.requests.post")
+    def test_banned_chat_id_callback_is_silently_dropped(self, mock_post):
+        mock_post.return_value = _mock_ok_response()
+        self.db.ban_user(self.chat_id, reason="test")
+        cb_data = self.tg._create_callback_data({"action": "cancel"})
+
+        self.tg._process_update(self._callback_update(cb_data))
+
+        mock_post.assert_not_called()
+
+    @patch("bot.telegram_ui.requests.post")
+    def test_flood_guard_bans_after_threshold(self, mock_post):
+        mock_post.return_value = _mock_ok_response()
+        self.tg.FLOOD_MAX_UPDATES = 2
+        self.tg.FLOOD_WINDOW_SECONDS = 100
+
+        for _ in range(3):
+            self.tg._process_update(self._text_update("/help"))
+
+        self.assertTrue(self.db.is_banned(self.chat_id))
+        self.assertIsNone(self.db.get_user(self.chat_id), "flood ban must also remove the subscription")
+
+    @patch("bot.telegram_ui.requests.post")
+    def test_flood_guard_exempts_superuser(self, mock_post):
+        mock_post.return_value = _mock_ok_response()
+        self.db.set_superuser(self.chat_id, True)
+        self.tg.FLOOD_MAX_UPDATES = 2
+        self.tg.FLOOD_WINDOW_SECONDS = 100
+
+        for _ in range(5):
+            self.tg._process_update(self._text_update("/help"))
+
+        self.assertFalse(self.db.is_banned(self.chat_id))
+
+    @patch("bot.telegram_ui.requests.post")
+    def test_oversized_input_triggers_ban(self, mock_post):
+        mock_post.return_value = _mock_ok_response()
+        self.tg.OVERSIZED_INPUT_THRESHOLD = 20
+        with self.db.lock:
+            self.tg.user_states[self.chat_id] = {"state": "waiting_new_cat_name", "timestamp": time.time()}
+
+        self.tg._process_update(self._text_update("x" * 100))
+
+        self.assertTrue(self.db.is_banned(self.chat_id))
+        self.assertNotIn(self.chat_id, self.tg.user_states)
+
+    @patch("bot.telegram_ui.requests.post")
+    def test_oversized_input_exempts_superuser(self, mock_post):
+        mock_post.return_value = _mock_ok_response()
+        self.db.set_superuser(self.chat_id, True)
+        self.tg.OVERSIZED_INPUT_THRESHOLD = 20
+        with self.db.lock:
+            self.tg.user_states[self.chat_id] = {"state": "waiting_new_cat_name", "timestamp": time.time()}
+
+        self.tg._process_update(self._text_update("x" * 100))
+
+        self.assertFalse(self.db.is_banned(self.chat_id))
+
+    @patch("bot.telegram_ui.requests.post")
+    def test_search_name_too_long_is_rejected(self, mock_post):
+        mock_post.return_value = _mock_ok_response()
+        self.tg.MAX_SEARCH_NAME_LENGTH = 10
+        with self.db.lock:
+            self.tg.user_states[self.chat_id] = {
+                "state": "waiting_keyword", "category": "Cat", "link": "https://www.subito.it/x",
+                "timestamp": time.time(),
+            }
+
+        self.tg._process_update(self._text_update("a very long search name"))
+
+        self.assertEqual(self.tg.user_states[self.chat_id]["state"], "waiting_keyword", "must stay in the naming step")
+        sent_texts = [c.kwargs["json"]["text"] for c in mock_post.call_args_list if "json" in c.kwargs and "text" in c.kwargs["json"]]
+        self.assertTrue(any("too long" in t.lower() for t in sent_texts))
+
+    @patch("bot.telegram_ui.requests.post")
+    def test_exclusion_keyword_is_truncated_to_max_length(self, mock_post):
+        mock_post.return_value = _mock_ok_response()
+        self.tg.MAX_KEYWORD_LENGTH = 5
+        with self.db.lock:
+            self.tg.user_states[self.chat_id] = {
+                "state": "waiting_exclusion", "category": "Cat", "link": "https://www.subito.it/x",
+                "name": "S1", "timestamp": time.time(),
+            }
+
+        self.tg._process_update(self._text_update("thisiswaytoolong"))
+
+        self.assertEqual(self.tg.user_states[self.chat_id]["exclusion_kws"], ["thisi"])
 
 
 class TestProjectHygiene(unittest.TestCase):

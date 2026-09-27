@@ -1,5 +1,5 @@
 """
-Filename: database.py
+Filename: bot/database.py
 Version: 4.0.0
 Date: 2026-04-30
 Author: Leonardo Lisa
@@ -104,6 +104,14 @@ class Database:
                     cursor.execute("ALTER TABLE searches ADD COLUMN enabled INTEGER DEFAULT 1")
                 if 'include_kws' not in existing_cols:
                     cursor.execute("ALTER TABLE searches ADD COLUMN include_kws TEXT DEFAULT '[]'")
+
+                # Same additive-migration pattern for `users`: `language` defaults to
+                # English ('en') per the roadmap ("default inglese altrimenti italiano").
+                # SQLite applies a non-null ADD COLUMN default to pre-existing rows too,
+                # so upgrading an older DB doesn't leave language NULL for anyone.
+                existing_user_cols = {row['name'] for row in cursor.execute("PRAGMA table_info(users)").fetchall()}
+                if 'language' not in existing_user_cols:
+                    cursor.execute("ALTER TABLE users ADD COLUMN language TEXT DEFAULT 'en'")
                 
                 # Indexes for faster queries
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_searches_chat_id ON searches(chat_id)")
@@ -115,6 +123,32 @@ class Database:
                     CREATE TABLE IF NOT EXISTS kv_store (
                         key TEXT PRIMARY KEY,
                         value TEXT NOT NULL
+                    )
+                ''')
+
+                # Tracks every ad notification message sent to a user, purely so it can
+                # later be auto-deleted once older than TelegramUI.AD_NOTIFICATION_RETENTION_DAYS
+                # (report item 5). Deliberately independent of `tracked_ads`: it records
+                # the Telegram message itself (for deletion), not ad-dedup state.
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS sent_notifications (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        chat_id INTEGER NOT NULL,
+                        message_id INTEGER NOT NULL,
+                        sent_at REAL NOT NULL
+                    )
+                ''')
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_sent_notifications_sent_at ON sent_notifications(sent_at)")
+
+                # Report item 8 (security audit): permanent bans. Deliberately a
+                # standalone table with NO foreign key to `users` - a ban must survive
+                # /unsub (which deletes the users row) or an admin removing the account,
+                # otherwise a banned abuser could simply /unsub + /sub again to reset.
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS banned_users (
+                        chat_id INTEGER PRIMARY KEY,
+                        reason TEXT,
+                        banned_at REAL NOT NULL
                     )
                 ''')
                 
@@ -283,6 +317,16 @@ class Database:
                 )
                 conn.commit()
 
+    def set_language(self, chat_id, lang):
+        """Sets a user's preferred UI language (see bot/i18n.py for supported codes)."""
+        with self.lock:
+            with self._connection() as conn:
+                conn.execute(
+                    "UPDATE users SET language = ? WHERE chat_id = ?",
+                    (lang, chat_id)
+                )
+                conn.commit()
+
     @staticmethod
     def _parse_kw_list(raw_value):
         try:
@@ -319,8 +363,10 @@ class Database:
             with self._connection() as conn:
                 # JOIN to ensure we only scrape for users who haven't expired their soft
                 # subscription window. The expiration check itself is left to main.py,
-                # which decides based on the returned user status.
-                cursor = conn.execute("SELECT s.*, u.last_active, u.is_superuser FROM searches s JOIN users u ON s.chat_id = u.chat_id")
+                # which decides based on the returned user status. `u.language` is
+                # included so the daemon loop can pick the right notification language
+                # without a second per-search DB round-trip.
+                cursor = conn.execute("SELECT s.*, u.last_active, u.is_superuser, u.language FROM searches s JOIN users u ON s.chat_id = u.chat_id")
                 rows = cursor.fetchall()
                 
                 searches = []
@@ -335,7 +381,8 @@ class Database:
                         "include_kws": self._parse_kw_list(r['include_kws']),
                         "enabled": bool(r['enabled']),
                         "last_active": r['last_active'],
-                        "is_superuser": r['is_superuser']
+                        "is_superuser": r['is_superuser'],
+                        "language": r['language'] or 'en'
                     })
                 return searches
 
@@ -365,6 +412,76 @@ class Database:
                     (search_id, ad_id, now)
                 )
                 conn.commit()
+
+    # --- Sent Notification Tracking (for auto-deletion, report item 5) ---
+
+    def record_sent_notification(self, chat_id, message_id):
+        """Records an ad notification message so it can be auto-deleted later once
+        older than TelegramUI.AD_NOTIFICATION_RETENTION_DAYS."""
+        now = time.time()
+        with self.lock:
+            with self._connection() as conn:
+                conn.execute(
+                    "INSERT INTO sent_notifications (chat_id, message_id, sent_at) VALUES (?, ?, ?)",
+                    (chat_id, message_id, now)
+                )
+                conn.commit()
+
+    def get_expired_notifications(self, cutoff_timestamp):
+        """Returns [{id, chat_id, message_id}, ...] for notifications sent before `cutoff_timestamp`."""
+        with self.lock:
+            with self._connection() as conn:
+                cursor = conn.execute(
+                    "SELECT id, chat_id, message_id FROM sent_notifications WHERE sent_at < ?",
+                    (cutoff_timestamp,)
+                )
+                return [dict(r) for r in cursor.fetchall()]
+
+    def delete_notification_record(self, record_id):
+        """Removes a single sent_notifications row after it's been processed (deleted
+        from Telegram, or the deletion attempt was made on a best-effort basis)."""
+        with self.lock:
+            with self._connection() as conn:
+                conn.execute("DELETE FROM sent_notifications WHERE id = ?", (record_id,))
+                conn.commit()
+
+    # --- Bans (report item 8: security audit / permanent bans) ---
+
+    def ban_user(self, chat_id, reason=""):
+        """Permanently bans a chat_id. Independent of the `users` table (no cascade),
+        so the ban survives /unsub or an admin removing the account."""
+        with self.lock:
+            with self._connection() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO banned_users (chat_id, reason, banned_at) VALUES (?, ?, ?)
+                    ON CONFLICT(chat_id) DO UPDATE SET reason=excluded.reason, banned_at=excluded.banned_at
+                    """,
+                    (chat_id, reason, time.time())
+                )
+                conn.commit()
+
+    def unban_user(self, chat_id):
+        """Lifts a ban, if any, for a chat_id."""
+        with self.lock:
+            with self._connection() as conn:
+                conn.execute("DELETE FROM banned_users WHERE chat_id = ?", (chat_id,))
+                conn.commit()
+
+    def is_banned(self, chat_id):
+        with self.lock:
+            with self._connection() as conn:
+                cursor = conn.execute("SELECT 1 FROM banned_users WHERE chat_id = ?", (chat_id,))
+                return cursor.fetchone() is not None
+
+    def get_all_banned(self):
+        """Returns [{chat_id, reason, banned_at}, ...] for every banned chat_id,
+        including ones with no corresponding row in `users` (e.g. banned then
+        unsubscribed, or banned before ever subscribing)."""
+        with self.lock:
+            with self._connection() as conn:
+                cursor = conn.execute("SELECT * FROM banned_users")
+                return [dict(r) for r in cursor.fetchall()]
 
     def trim_tracked_items(self, max_items=150):
         """
