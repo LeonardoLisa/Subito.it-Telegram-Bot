@@ -96,27 +96,44 @@ def format_message(matches, ad, lang=DEFAULT_LANGUAGE):
     the right using a couple of em-spaces before a monospaced <code> tag - it will not
     align pixel-perfectly across every client/device.
     """
-    desc = ad['description'][:200] + '...' if len(ad['description']) > 200 else ad['description']
+    raw_desc = str(ad.get('description') or '')
+    desc = raw_desc[:200] + '...' if len(raw_desc) > 200 else raw_desc
     category, name = matches[0]
 
-    first_line = f"📂 <b>{html.escape(category)}</b> | 🔍 <i>{html.escape(name)}</i>"
+    first_line = f"📂 <b>{html.escape(str(category))}</b> | 🔍 <i>{html.escape(str(name))}</i>"
     ad_id = ad.get('id')
     if ad_id:
         first_line += f"\u2003\u2003<code>#{html.escape(str(ad_id))}</code>"
 
     header_lines = [first_line]
     if len(matches) > 1:
-        extra_names = ", ".join(html.escape(other_name) for _, other_name in matches[1:])
+        extra_names = ", ".join(html.escape(str(other_name)) for _, other_name in matches[1:])
         header_lines.append(t("also_found_by", lang, names=extra_names))
 
-    return (
+    title_safe = html.escape(str(ad.get('title') or ''))
+    price_safe = html.escape(str(ad.get('price') or ''))
+    location_safe = html.escape(str(ad.get('location') or ''))
+    desc_safe = html.escape(desc)
+
+    base_msg = (
         "\n".join(header_lines) + "\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>{html.escape(ad['title'])}</b>\n"
-        f"{t('ad_price_label', lang, price=html.escape(ad['price']))}\n"
-        f"{t('ad_location_label', lang, location=html.escape(ad['location']))}\n\n"
-        f"📝 <i>{html.escape(desc)}</i>"
+        f"<b>{title_safe}</b>\n"
+        f"{t('ad_price_label', lang, price=price_safe)}\n"
+        f"{t('ad_location_label', lang, location=location_safe)}\n\n"
+        f"📝 "
     )
+
+    # Guarantee total message length stays within Telegram's 1024-char photo caption
+    # limit without ever slicing inside HTML tags or HTML entities.
+    max_total_len = 1000
+    overhead = len(base_msg) + len("<i></i>")
+    if overhead + len(desc_safe) > max_total_len:
+        available = max(0, max_total_len - overhead - 3)
+        raw_truncated = desc[:available]
+        desc_safe = html.escape(raw_truncated) + "..."
+
+    return f"{base_msg}<i>{desc_safe}</i>"
 
 def main():
     global DEBUG_MODE
@@ -265,7 +282,14 @@ def main():
                             # list the additional search instead of re-notifying.
                             existing["matches"].append((category, name))
                             new_text = format_message(existing["matches"], existing["ad"], lang)
-                            tg.edit_ad_message(chat_id, existing["message_id"], new_text, existing["is_photo"])
+                            tg.edit_ad_message(
+                                chat_id,
+                                existing["message_id"],
+                                new_text,
+                                existing["is_photo"],
+                                item_url=existing["ad"].get("link"),
+                                lang=lang
+                            )
                         else:
                             img = scraper.download_image(ad['image_url'])
                             matches = [(category, name)]

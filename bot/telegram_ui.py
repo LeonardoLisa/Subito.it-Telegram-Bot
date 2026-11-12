@@ -359,6 +359,14 @@ class TelegramUI:
         except Exception as e:
             self._debug_print(f"Direct Msg Net Error: {e}")
 
+    def _build_ad_reply_markup(self, item_url=None, lang=DEFAULT_LANGUAGE):
+        """Builds the inline keyboard markup dictionary for an ad notification."""
+        reply_markup = {"inline_keyboard": []}
+        if item_url:
+            reply_markup["inline_keyboard"].append([{"text": t("btn_go_to_ad", lang), "url": str(item_url)}])
+        reply_markup["inline_keyboard"].append([{"text": t("btn_delete", lang), "callback_data": "delete_msg"}])
+        return reply_markup
+
     def send_ad(self, chat_id, msg_text, image_bytes=None, item_url=None, lang=DEFAULT_LANGUAGE):
         """
         Sends an ad notification directly to a specific user (replaces global broadcast
@@ -367,16 +375,13 @@ class TelegramUI:
         exact message in place if another of the user's searches matches the same ad
         within the same scan pass (report item 1), instead of sending a duplicate.
         """
-        reply_markup = {"inline_keyboard": []}
-        if item_url:
-            reply_markup["inline_keyboard"].append([{"text": t("btn_go_to_ad", lang), "url": item_url}])
-        reply_markup["inline_keyboard"].append([{"text": t("btn_delete", lang), "callback_data": "delete_msg"}])
+        reply_markup = self._build_ad_reply_markup(item_url=item_url, lang=lang)
         reply_markup_json = json.dumps(reply_markup)
 
         try:
             if image_bytes:
                 url = f"https://api.telegram.org/bot{self.token}/sendPhoto"
-                payload = {"chat_id": chat_id, "caption": msg_text[:1024], "parse_mode": "HTML", "reply_markup": reply_markup_json}
+                payload = {"chat_id": chat_id, "caption": msg_text, "parse_mode": "HTML", "reply_markup": reply_markup_json}
                 files = {"photo": ("image.jpg", image_bytes, "image/jpeg")}
                 res = requests.post(url, data=payload, files=files, timeout=15)
                 data = res.json()
@@ -418,22 +423,29 @@ class TelegramUI:
                 self._debug_print(f"Notification purge delete error: {e}")
             self.db.delete_notification_record(record["id"])
 
-    def edit_ad_message(self, chat_id, message_id, new_text, is_photo):
+    def edit_ad_message(self, chat_id, message_id, new_text, is_photo, item_url=None, lang=DEFAULT_LANGUAGE):
         """
         Rewrites an already-sent ad notification in place (report item 1: when another
         of the user's searches matches the same ad within the same scan pass, the ad is
         re-notified by editing the existing message instead of sending a duplicate).
         Uses editMessageCaption for photo messages and editMessageText otherwise.
-        `reply_markup` is intentionally omitted from the request: Telegram preserves
-        the existing inline keyboard unless a new one is explicitly supplied.
+        `reply_markup` MUST be explicitly re-supplied: in Telegram Bot API, omitting
+        `reply_markup` on editMessageText/editMessageCaption clears the inline keyboard.
         """
         endpoint = "editMessageCaption" if is_photo else "editMessageText"
         url = f"https://api.telegram.org/bot{self.token}/{endpoint}"
-        payload = {"chat_id": chat_id, "message_id": message_id, "parse_mode": "HTML"}
+        reply_markup = self._build_ad_reply_markup(item_url=item_url, lang=lang)
+        payload = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "parse_mode": "HTML",
+            "reply_markup": reply_markup,
+        }
         if is_photo:
-            payload["caption"] = new_text[:1024]
+            payload["caption"] = new_text
         else:
             payload["text"] = new_text
+            payload["disable_web_page_preview"] = True
         try:
             res = requests.post(url, json=payload, timeout=10)
             data = res.json()
@@ -479,9 +491,10 @@ class TelegramUI:
         itself is sent verbatim (not translated)."""
         users = self.db.get_all_users()
         payload = {}
+        escaped_admin_text = html.escape(str(admin_text))
         for u in users:
             lang = u.get('language') or DEFAULT_LANGUAGE
-            payload[u['chat_id']] = (f"{t('announcement_label', lang)}\n\n{admin_text}", lang)
+            payload[u['chat_id']] = (f"{t('announcement_label', lang)}\n\n{escaped_admin_text}", lang)
         self._broadcast_raw(payload, show_delete=True)
 
     def poll_updates(self):
@@ -580,7 +593,7 @@ class TelegramUI:
                 keyboard = {"inline_keyboard": []}
                 for cat in searches.keys():
                     cb_data = self._create_callback_data({"action": "cat", "cat": cat})
-                    keyboard["inline_keyboard"].append([{"text": f"📁 {cat}", "callback_data": cb_data}])
+                    keyboard["inline_keyboard"].append([{"text": f"📂 {cat}", "callback_data": cb_data}])
                 cb_addcat = self._create_callback_data({"action": "start_add_category"})
                 keyboard["inline_keyboard"].append([{"text": t("btn_add_category", lang), "callback_data": cb_addcat}])
                 keyboard["inline_keyboard"].append([{"text": t("btn_close", lang), "callback_data": "delete_msg"}])
@@ -849,7 +862,7 @@ class TelegramUI:
                 keyboard = {"inline_keyboard": []}
                 for cat in searches.keys():
                     c_data = self._create_callback_data({"action": "cat", "cat": cat})
-                    keyboard["inline_keyboard"].append([{"text": f"📁 {cat}", "callback_data": c_data}])
+                    keyboard["inline_keyboard"].append([{"text": f"📂 {cat}", "callback_data": c_data}])
                 cb_addcat = self._create_callback_data({"action": "start_add_category"})
                 keyboard["inline_keyboard"].append([{"text": t("btn_add_category", lang), "callback_data": cb_addcat}])
                 keyboard["inline_keyboard"].append([{"text": t("btn_close", lang), "callback_data": "delete_msg"}])
